@@ -1,0 +1,52 @@
+name: nuclei
+
+# Reusable post-deploy check of a live URL. Call it from a release workflow after the deploy job:
+#   smoke:
+#     needs: deploy
+#     uses: <org>/.github/.github/workflows/nuclei.yml@<sha>
+#     with:
+#       url: https://app.example.indicia-ai.com
+on:
+  workflow_call:
+    inputs:
+      url:
+        description: Live base URL to scan
+        required: true
+        type: string
+      severity:
+        description: Severities that fail the job
+        required: false
+        type: string
+        default: high,critical
+
+permissions: {}
+
+env:
+  NUCLEI_VERSION: 3.11.1
+  NUCLEI_SHA256: ea63d4ae232808cd7c6bc00d0142428e231fab59dae01042246097d195835ab6
+
+jobs:
+  nuclei:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Install nuclei
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o nuclei.zip "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip"
+          echo "${NUCLEI_SHA256}  nuclei.zip" | sha256sum -c -
+          unzip -q nuclei.zip nuclei && chmod +x nuclei
+      - name: Scan
+        env:
+          TARGET: ${{ inputs.url }}
+          SEVERITY: ${{ inputs.severity }}
+        run: |
+          "$RUNNER_TEMP/nuclei" -u "$TARGET" -severity "$SEVERITY" -rate-limit 20 -silent -disable-update-check -no-interactsh -jsonl -o "$RUNNER_TEMP/nuclei.jsonl"
+          if [ -s "$RUNNER_TEMP/nuclei.jsonl" ]; then
+            jq -r '"\(.info.severity) \(.["template-id"]) \(.["matched-at"])"' "$RUNNER_TEMP/nuclei.jsonl"
+            echo "::error::nuclei found ${SEVERITY} issues on ${TARGET}"
+            exit 1
+          fi

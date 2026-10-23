@@ -1,0 +1,118 @@
+name: security
+
+# Required on every pull request to a default branch in this organization (org ruleset "golf2").
+# Also callable from a repo's own workflow: `uses: <org>/.github/.github/workflows/security.yml@<sha>`.
+#
+# Scanners, all pinned by version and checksum or digest:
+#   gitleaks     secrets in the commits of this PR
+#   osv-scanner  known vulnerabilities in every lockfile (fails when lockfiles exist but no package was read)
+#   trivy        misconfiguration in Dockerfiles, compose, Kubernetes and Terraform
+#   zizmor       GitHub Actions workflow security
+#   semgrep      code patterns, ERROR severity only
+#   bandit       Python code, high severity (only when the repo has Python files)
+#
+# Suppressions live in the repo and need a reason and a review date:
+#   osv-scanner.toml (ignoredVulns with ignoreUntil), .trivyignore, .gitleaksignore,
+#   `# zizmor: ignore[rule]`, `# nosemgrep: <rule>`, `# nosec <test>`.
+on:
+  pull_request:
+  merge_group:
+  workflow_call:
+
+permissions: {}
+
+concurrency:
+  group: security-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  OSV_VERSION: 2.7.0
+  OSV_SHA256: 160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b
+  TRIVY_VERSION: 0.76.1
+  TRIVY_SHA256: c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0
+  ZIZMOR_IMAGE: ghcr.io/zizmorcore/zizmor:1.31.1@sha256:42d409dbb851d4c5d35a058cf042b828bea1e3f2884378c526eb0974780e18d9
+  SEMGREP_IMAGE: semgrep/semgrep:1.180.0@sha256:529ee8a277ec8adc5b534d7c74eea0a47e9de21d62852b6ba7ac6ba9566845c3
+  BANDIT_VERSION: 1.9.4
+
+jobs:
+  scan:
+    name: scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install scanners
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin" && cd "$RUNNER_TEMP"
+          fetch() { curl -fsSL --retry 3 -o "$1" "$2"; echo "$3  $1" | sha256sum -c -; }
+          fetch gitleaks.tgz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" "$GITLEAKS_SHA256"
+          tar -xzf gitleaks.tgz -C bin gitleaks
+          fetch bin/osv-scanner "https://github.com/google/osv-scanner/releases/download/v${OSV_VERSION}/osv-scanner_linux_amd64" "$OSV_SHA256"
+          chmod +x bin/osv-scanner
+          fetch trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" "$TRIVY_SHA256"
+          tar -xzf trivy.tgz -C bin trivy
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: gitleaks (commits in this change)
+        id: gitleaks
+        if: always()
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ -n "$BASE" ] && [ "$BASE" != 0000000000000000000000000000000000000000 ] && git cat-file -e "$BASE" 2>/dev/null; then
+            gitleaks git --no-banner --redact --exit-code 1 --log-opts="${BASE}..${HEAD}" .
+          else
+            gitleaks git --no-banner --redact --exit-code 1 --log-opts="-1 ${HEAD}" .
+          fi
+
+      - name: osv-scanner (lockfiles)
+        id: osv
+        if: always()
+        run: |
+          set -uo pipefail
+          args=(scan source -r --format table)
+          [ -f osv-scanner.toml ] && args+=(--config osv-scanner.toml)
+          osv-scanner "${args[@]}" . 2>&1 | tee "$RUNNER_TEMP/osv.txt"
+          code=${PIPESTATUS[0]}
+          # 128: no lockfile or manifest in the repo, nothing to scan.
+          if [ "$code" = 128 ]; then echo "No package sources found."; exit 0; fi
+          # A scanner that read nothing is not a clean scan.
+          if grep -q 'found 0 packages' "$RUNNER_TEMP/osv.txt"; then
+            echo "::error::osv-scanner read a lockfile but found 0 packages in it. Check the lockfile format and the scanner version."
+            exit 1
+          fi
+          exit "$code"
+
+      - name: trivy (configuration)
+        id: trivy
+        if: always()
+        run: trivy config --quiet --severity HIGH,CRITICAL --exit-code 1 .
+
+      - name: zizmor (workflows)
+        id: zizmor
+        if: always() && hashFiles('.github/workflows/*.yml', '.github/workflows/*.yaml') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: docker run --rm -e GH_TOKEN -v "$PWD:/repo:ro" -w /repo "$ZIZMOR_IMAGE" --format plain .github/workflows
+
+      - name: semgrep (code, ERROR severity)
+        id: semgrep
+        if: always()
+        run: docker run --rm -v "$PWD:/src" -w /src "$SEMGREP_IMAGE" semgrep scan --config p/default --severity ERROR --error --metrics off --quiet --exclude node_modules --exclude dist --exclude .next
+
+      - name: bandit (Python, high severity)
+        id: bandit
+        if: always() && hashFiles('**/*.py') != ''
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check --user "bandit==${BANDIT_VERSION}"
+          python3 -m bandit -q -r . -x ./node_modules,./.venv,./venv,./tests,./test --severity-level high --confidence-level medium
