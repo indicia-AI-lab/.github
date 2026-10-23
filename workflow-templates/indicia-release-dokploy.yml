@@ -1,0 +1,110 @@
+name: Release
+
+# Indicia standard release: tag X.Y.Z on the default branch -> checks -> image on GHCR (amd64, GitHub-hosted)
+# -> Trivy scan of the pushed digest -> Dokploy webhook -> nuclei check of the live URL.
+# Only the `release` team can create X.Y.Z tags (org ruleset golf1-release-tags).
+# Repo settings: secret DOKPLOY_WEBHOOK_URL, variable LIVE_URL (e.g. https://app.test.indicia-ai.com).
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Tag must be on the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: git merge-base --is-ancestor "$GITHUB_SHA" "origin/$DEFAULT_BRANCH" || { echo "::error::Tag $GITHUB_REF_NAME is not on $DEFAULT_BRANCH"; exit 1; }
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck --if-present
+      - run: npm test --if-present
+
+  build:
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Image name
+        run: echo "IMAGE=ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          pull: true
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.ref_name }}
+            ${{ env.IMAGE }}:latest
+      - id: ref
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: echo "image=${IMAGE}@${DIGEST}" >> "$GITHUB_OUTPUT"
+      - name: Trivy scan of the pushed image
+        env:
+          REF: ${{ steps.ref.outputs.image }}
+          TRIVY_VERSION: 0.76.1
+          TRIVY_SHA256: c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSL -o trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum -c - && tar -xzf trivy.tgz trivy
+          ./trivy image --quiet --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$REF"
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Dokploy webhook
+        env:
+          WEBHOOK: ${{ secrets.DOKPLOY_WEBHOOK_URL }}
+        run: |
+          [ -n "$WEBHOOK" ] || { echo "::error::DOKPLOY_WEBHOOK_URL is not set"; exit 1; }
+          curl -fsS --retry 3 --retry-delay 5 -X POST "$WEBHOOK" -o /dev/null
+
+  # Verify the deployed revision yourself as well: a green webhook only means Dokploy accepted the request.
+  smoke:
+    needs: deploy
+    if: vars.LIVE_URL != ''
+    permissions:
+      contents: read
+    uses: indicia-AI-lab/.github/.github/workflows/nuclei.yml@6a0ae02d91c351e6e489ec5cd85f87e906d91ac6 # main
+    with:
+      url: ${{ vars.LIVE_URL }}

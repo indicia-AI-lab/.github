@@ -1,0 +1,1 @@
+{"name":"Indicia release naar Dokploy","description":"Tag X.Y.Z op main: checks, amd64-image naar GHCR, Trivy op de digest, Dokploy-webhook, nuclei op de live-URL.","iconName":"octicon rocket","categories":["Deployment","Containers"]}

@@ -1,0 +1,1 @@
+{"name":"Indicia CI (Node)","description":"Lint, typecheck, test en npm audit op elke PR en op main. Node uit .node-version.","iconName":"octicon check-circle","categories":["JavaScript","TypeScript","Node"]}

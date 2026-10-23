@@ -1,0 +1,36 @@
+name: CI
+
+# Indicia standard: lint, typecheck and tests on every pull request and on main.
+# The org also runs the required `security` workflow on every pull request; you do not need to add it here.
+# Node comes from .node-version (put e.g. 24.22.1 in it); npm by default, see the comments for pnpm and bun.
+on:
+  pull_request:
+  push:
+    branches: [$default-branch]
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+      # pnpm: corepack enable && pnpm install --frozen-lockfile; bun: use oven-sh/setup-bun pinned by SHA.
+      - run: npm ci --no-audit --no-fund
+      - run: npm audit --audit-level=high --omit=dev
+      - run: npm run lint --if-present
+      - run: npm run typecheck --if-present
+      - run: npm test --if-present
