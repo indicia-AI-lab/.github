@@ -105,6 +105,6 @@ jobs:
     if: vars.LIVE_URL != ''
     permissions:
       contents: read
-    uses: indicia-AI-lab/.github/.github/workflows/nuclei.yml@6a0ae02d91c351e6e489ec5cd85f87e906d91ac6 # main
+    uses: indicia-AI-lab/.github/.github/workflows/nuclei.yml@6a0ae02d91c351e6e489ec5cd85f87e906d91ac6 # v1.0.0
     with:
       url: ${{ vars.LIVE_URL }}
