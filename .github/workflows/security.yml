@@ -79,7 +79,8 @@ jobs:
         id: osv
         if: always()
         run: |
-          set -uo pipefail
+          # Runs under bash -e; turn -e off so the exit code reaches the checks below.
+          set +e -uo pipefail
           args=(scan source -r --format table)
           [ -f osv-scanner.toml ] && args+=(--config osv-scanner.toml)
           osv-scanner "${args[@]}" . 2>&1 | tee "$RUNNER_TEMP/osv.txt"
