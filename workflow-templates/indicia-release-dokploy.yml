@@ -9,6 +9,8 @@ name: Release
 #   - environments `acceptance` and `production`, deployment policy "selected branches and tags",
 #     tags only (acceptance: `*-rc*`, production: `[0-9]*`)
 #   - per environment: secret DOKPLOY_WEBHOOK_URL, variable LIVE_URL (e.g. https://app.test.indicia-ai.com)
+#     More than one Dokploy app (e.g. frontend + backend): secret DOKPLOY_WEBHOOK_URLS instead, one URL
+#     per line, fired in that order. Any failing webhook fails the job. DOKPLOY_WEBHOOK_URLS wins when both are set.
 #   - Dokploy apps: acc on the test VPS pulling :acc, prod on the prod VPS pulling :latest
 #   - org custom property `deploy_target` (prod-vps, test-vps, mac-mini, none)
 on:
@@ -106,12 +108,23 @@ jobs:
     outputs:
       live_url: ${{ steps.live.outputs.url }}
     steps:
-      - name: Dokploy webhook
+      - name: Dokploy webhook(s)
         env:
+          WEBHOOKS: ${{ secrets.DOKPLOY_WEBHOOK_URLS }}
           WEBHOOK: ${{ secrets.DOKPLOY_WEBHOOK_URL }}
         run: |
-          [ -n "$WEBHOOK" ] || { echo "::error::DOKPLOY_WEBHOOK_URL is not set in this environment"; exit 1; }
-          curl -fsS --retry 3 --retry-delay 5 -X POST "$WEBHOOK" -o /dev/null
+          set -euo pipefail
+          urls="${WEBHOOKS:-$WEBHOOK}"
+          n=0
+          while IFS= read -r url || [ -n "$url" ]; do
+            url="$(printf '%s' "$url" | tr -d '[:space:]')"
+            [ -n "$url" ] || continue
+            n=$((n + 1))
+            echo "Webhook $n"
+            curl -fsS --retry 3 --retry-delay 5 -X POST "$url" -o /dev/null \
+              || { echo "::error::Dokploy webhook $n failed"; exit 1; }
+          done <<< "$urls"
+          [ "$n" -gt 0 ] || { echo "::error::Neither DOKPLOY_WEBHOOK_URLS nor DOKPLOY_WEBHOOK_URL is set in this environment"; exit 1; }
       # A reusable-workflow job cannot use an environment, so hand the environment's LIVE_URL on.
       - id: live
         env:
