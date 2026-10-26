@@ -137,6 +137,6 @@ jobs:
     if: needs.deploy.outputs.live_url != ''
     permissions:
       contents: read
-    uses: indicia-AI-lab/.github/.github/workflows/nuclei.yml@68a444b8af071bd73f0da7eea0ae7fa32e1ba149 # v1.0.1
+    uses: indicia-AI-lab/.github/.github/workflows/nuclei.yml@5d654423d6835242390e6b33d1a520efd187ca45 # v1.0.2
     with:
       url: ${{ needs.deploy.outputs.live_url }}
