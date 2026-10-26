@@ -1,18 +1,26 @@
 name: Release
 
-# Indicia standard release: tag X.Y.Z on the default branch -> checks -> image on GHCR (amd64, GitHub-hosted)
+# Indicia standard release: tag -> checks -> image on GHCR (amd64, GitHub-hosted)
 # -> Trivy scan of the pushed digest -> Dokploy webhook -> nuclei check of the live URL.
-# Only the `release` team can create X.Y.Z tags (org ruleset golf1-release-tags).
-# Repo settings: secret DOKPLOY_WEBHOOK_URL, variable LIVE_URL (e.g. https://app.test.indicia-ai.com).
+#   X.Y.Z      -> environment production, tag must be on the default branch, image :X.Y.Z + :latest
+#   X.Y.Z-rc.N -> environment acceptance, any branch, image :X.Y.Z-rc.N + :acc
+# Only `release` can create X.Y.Z tags; `developers` and `release` can create -rc tags (org rulesets).
+# Repo setup:
+#   - environments `acceptance` and `production`, deployment policy "selected branches and tags",
+#     tags only (acceptance: `*-rc*`, production: `[0-9]*`)
+#   - per environment: secret DOKPLOY_WEBHOOK_URL, variable LIVE_URL (e.g. https://app.test.indicia-ai.com)
+#   - Dokploy apps: acc on the test VPS pulling :acc, prod on the prod VPS pulling :latest
+#   - org custom property `deploy_target` (prod-vps, test-vps, mac-mini, none)
 on:
   push:
     tags:
       - "[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+"
 
 permissions: {}
 
 concurrency:
-  group: release
+  group: release-${{ contains(github.ref_name, '-rc.') && 'acceptance' || 'production' }}
   cancel-in-progress: false
 
 jobs:
@@ -21,12 +29,15 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
+    outputs:
+      environment: ${{ contains(github.ref_name, '-rc.') && 'acceptance' || 'production' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Tag must be on the default branch
+      - name: Production tag must be on the default branch
+        if: ${{ !contains(github.ref_name, '-rc.') }}
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: git merge-base --is-ancestor "$GITHUB_SHA" "origin/$DEFAULT_BRANCH" || { echo "::error::Tag $GITHUB_REF_NAME is not on $DEFAULT_BRANCH"; exit 1; }
@@ -68,7 +79,7 @@ jobs:
           push: true
           tags: |
             ${{ env.IMAGE }}:${{ github.ref_name }}
-            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ needs.checks.outputs.environment == 'acceptance' && 'acc' || 'latest' }}
       - id: ref
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
@@ -87,24 +98,32 @@ jobs:
           ./trivy image --quiet --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$REF"
 
   deploy:
-    needs: build
+    needs: [checks, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions: {}
+    environment: ${{ needs.checks.outputs.environment }}
+    outputs:
+      live_url: ${{ steps.live.outputs.url }}
     steps:
       - name: Dokploy webhook
         env:
           WEBHOOK: ${{ secrets.DOKPLOY_WEBHOOK_URL }}
         run: |
-          [ -n "$WEBHOOK" ] || { echo "::error::DOKPLOY_WEBHOOK_URL is not set"; exit 1; }
+          [ -n "$WEBHOOK" ] || { echo "::error::DOKPLOY_WEBHOOK_URL is not set in this environment"; exit 1; }
           curl -fsS --retry 3 --retry-delay 5 -X POST "$WEBHOOK" -o /dev/null
+      # A reusable-workflow job cannot use an environment, so hand the environment's LIVE_URL on.
+      - id: live
+        env:
+          LIVE_URL: ${{ vars.LIVE_URL }}
+        run: echo "url=${LIVE_URL}" >> "$GITHUB_OUTPUT"
 
   # Verify the deployed revision yourself as well: a green webhook only means Dokploy accepted the request.
   smoke:
     needs: deploy
-    if: vars.LIVE_URL != ''
+    if: needs.deploy.outputs.live_url != ''
     permissions:
       contents: read
-    uses: indicia-AI-lab/.github/.github/workflows/nuclei.yml@6a0ae02d91c351e6e489ec5cd85f87e906d91ac6 # v1.0.0
+    uses: indicia-AI-lab/.github/.github/workflows/nuclei.yml@68a444b8af071bd73f0da7eea0ae7fa32e1ba149 # v1.0.1
     with:
-      url: ${{ vars.LIVE_URL }}
+      url: ${{ needs.deploy.outputs.live_url }}
