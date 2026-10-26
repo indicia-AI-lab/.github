@@ -87,9 +87,13 @@ jobs:
           code=${PIPESTATUS[0]}
           # 128: no lockfile or manifest in the repo, nothing to scan.
           if [ "$code" = 128 ]; then echo "No package sources found."; exit 0; fi
-          # A scanner that read nothing is not a clean scan.
-          if grep -q 'found 0 packages' "$RUNNER_TEMP/osv.txt"; then
-            echo "::error::osv-scanner read a lockfile but found 0 packages in it. Check the lockfile format and the scanner version."
+          # A scanner that read nothing is not a clean scan. Directories are
+          # osv's vendored-code extractor (e.g. vendor/), which reports 0
+          # packages for source it cannot match; only files count here.
+          empty=$(sed -n 's/^Scanned \(.*\) file and found 0 packages$/\1/p' "$RUNNER_TEMP/osv.txt" \
+            | while IFS= read -r f; do [ -d "$f" ] || printf '%s\n' "$f"; done)
+          if [ -n "$empty" ]; then
+            echo "::error::osv-scanner read a lockfile but found 0 packages in it: $(echo "$empty" | paste -sd, -). Check the lockfile format and the scanner version."
             exit 1
           fi
           exit "$code"
