@@ -24,6 +24,9 @@ permissions: {}
 env:
   NUCLEI_VERSION: 3.11.1
   NUCLEI_SHA256: ea63d4ae232808cd7c6bc00d0142428e231fab59dae01042246097d195835ab6
+  # Templates are pinned too: with -disable-update-check nuclei never downloads them itself.
+  TEMPLATES_VERSION: 10.5.1
+  TEMPLATES_SHA256: 30fe1cfaced4635f886e4a2673641bba86998dceec28e468274524e789aa56eb
 
 jobs:
   nuclei:
@@ -39,12 +42,15 @@ jobs:
           curl -fsSL --retry 3 -o nuclei.zip "https://github.com/projectdiscovery/nuclei/releases/download/v${NUCLEI_VERSION}/nuclei_${NUCLEI_VERSION}_linux_amd64.zip"
           echo "${NUCLEI_SHA256}  nuclei.zip" | sha256sum -c -
           unzip -q nuclei.zip nuclei && chmod +x nuclei
+          curl -fsSL --retry 3 -o templates.tgz "https://github.com/projectdiscovery/nuclei-templates/archive/refs/tags/v${TEMPLATES_VERSION}.tar.gz"
+          echo "${TEMPLATES_SHA256}  templates.tgz" | sha256sum -c -
+          mkdir nuclei-templates && tar -xzf templates.tgz -C nuclei-templates --strip-components=1
       - name: Scan
         env:
           TARGET: ${{ inputs.url }}
           SEVERITY: ${{ inputs.severity }}
         run: |
-          "$RUNNER_TEMP/nuclei" -u "$TARGET" -severity "$SEVERITY" -rate-limit 20 -silent -disable-update-check -no-interactsh -jsonl -o "$RUNNER_TEMP/nuclei.jsonl"
+          "$RUNNER_TEMP/nuclei" -u "$TARGET" -t "$RUNNER_TEMP/nuclei-templates" -severity "$SEVERITY" -rate-limit 20 -silent -disable-update-check -no-interactsh -jsonl -o "$RUNNER_TEMP/nuclei.jsonl"
           if [ -s "$RUNNER_TEMP/nuclei.jsonl" ]; then
             jq -r '"\(.info.severity) \(.["template-id"]) \(.["matched-at"])"' "$RUNNER_TEMP/nuclei.jsonl"
             echo "::error::nuclei found ${SEVERITY} issues on ${TARGET}"
