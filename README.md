@@ -26,7 +26,7 @@ The starter workflow "Indicia release naar Dokploy" routes on the tag name. To s
 
 A repo that only runs in one environment leaves the other one empty. A tag for that environment builds, but the deploy job fails. The custom property `deploy_target` (`prod-vps`, `test-vps`, `mac-mini`, `none`) records where each repo deploys. Only org admins can set it.
 
-`v*` tags and `X.Y.Zrc1`-style tags do not start the release workflow.
+`v*` tags and rc tags without the dot (`1.4.0-rc1`) do not start the release workflow.
 
 ## Rules
 
