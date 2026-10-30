@@ -20,7 +20,7 @@ name: release-dokploy
 #     release:
 #       permissions: { contents: read, actions: read, packages: write }
 #       uses: <org>/.github/.github/workflows/release-dokploy.yml@<sha> # vX.Y.Z
-# (no `secrets:` needed: the deploy job reads the environment's secrets itself)
+#       secrets: inherit # zizmor: ignore[secrets-inherit] environment secrets reach a reusable workflow only this way
 #       with: { node-version: "22.23.4" }
 # Repo setup: environments `acceptance` (tags `*-rc*`) and `production` (tags `[0-9]*`), each with
 # secret DOKPLOY_WEBHOOK_URLS (one URL per line, fired in order) or DOKPLOY_WEBHOOK_URL and variable
@@ -92,15 +92,6 @@ on:
         description: Let Trivy skip HIGH/CRITICAL findings without a fixed version
         type: boolean
         default: true
-    secrets:
-      DOKPLOY_WEBHOOK_URLS:
-        description: >-
-          Only for repos without environments (legacy repo secret). An environment secret with the same
-          name always wins in the deploy job.
-        required: false
-      DOKPLOY_WEBHOOK_URL:
-        description: Single-app fallback, same rules as DOKPLOY_WEBHOOK_URLS
-        required: false
 
 permissions: {}
 
