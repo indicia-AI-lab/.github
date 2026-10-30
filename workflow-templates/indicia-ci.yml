@@ -19,7 +19,7 @@ jobs:
   ci:
     permissions:
       contents: read
-    uses: indicia-AI-lab/.github/.github/workflows/ci-node.yml@c3b49a10a656b6cbd8fcc5872e7a4ffc1dced727 # v1.1.0
+    uses: indicia-AI-lab/.github/.github/workflows/ci-node.yml@282f03b5ab6bba23077669885bb88dab534dcc89 # v1.1.1
     # with:
     #   node-version: "24.22.1"        # or keep the default node-version-file: .node-version
     #   package-manager: pnpm          # npm (default), pnpm, bun
