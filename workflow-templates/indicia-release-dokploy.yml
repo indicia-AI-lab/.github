@@ -29,7 +29,7 @@ jobs:
       contents: read
       actions: read
       packages: write
-    uses: indicia-AI-lab/.github/.github/workflows/release-dokploy.yml@e61b78b271447b665922a565deb7286021aebf19 # v1.2.0
+    uses: indicia-AI-lab/.github/.github/workflows/release-dokploy.yml@6fd64e03b4722f1507afd89018d807dc68b06338 # v1.3.1
     # Environment secrets (DOKPLOY_WEBHOOK_URL[S]) reach the reusable deploy job only via inherit;
     # the reusable workflow is our own, pinned by SHA.
     # nosemgrep: yaml.github-actions.security.secrets-inherit.secrets-inherit -- environment secrets, own pinned workflow
