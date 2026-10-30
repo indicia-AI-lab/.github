@@ -1,0 +1,485 @@
+name: release-dokploy
+
+# Reusable release for family A (one image, Node or static, Dockerfile, Dokploy via tags):
+#   tag -> image on GHCR -> Trivy on the digest -> release tags -> Dokploy webhook(s) -> nuclei smoke.
+#   X.Y.Z      -> environment production, tag must be on the default branch, image :X.Y.Z + :latest
+#   X.Y.Z-rc.N -> environment acceptance, any branch, image :X.Y.Z-rc.N + :acc
+# Every build pushes :sha-<commit> first; the release tags follow only after checks and Trivy pass.
+# A prod tag on a commit that an rc run already built reuses that digest (artifact `release-image`
+# of an rc run of the caller workflow on the same commit): no checks or rebuild, but a fresh Trivy
+# scan against today's DB. Without such an rc run it builds like an rc does (checks next to build).
+# No caches anywhere: this workflow publishes the production image (cache poisoning).
+#
+# Caller (.github/workflows/release.yml or deploy.yml). No concurrency cancel: never cancel a deploy.
+#   on: { push: { tags: ["[0-9]+.[0-9]+.[0-9]+", "[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+"] } }
+#   permissions: {}
+#   concurrency:
+#     group: release-${{ contains(github.ref_name, '-rc.') && 'acceptance' || 'production' }}
+#     cancel-in-progress: false
+#   jobs:
+#     release:
+#       permissions: { contents: read, actions: read, packages: write }
+#       uses: <org>/.github/.github/workflows/release-dokploy.yml@<sha> # vX.Y.Z
+#       secrets: inherit # zizmor: ignore[secrets-inherit] environment secrets reach a reusable workflow only this way
+#       with: { node-version: "22.23.4" }
+# Repo setup: environments `acceptance` (tags `*-rc*`) and `production` (tags `[0-9]*`), each with
+# secret DOKPLOY_WEBHOOK_URLS (one URL per line, fired in order) or DOKPLOY_WEBHOOK_URL and variable
+# LIVE_URL. An environment without a webhook ends red on purpose: that environment does not exist.
+on:
+  workflow_call:
+    inputs:
+      checks:
+        description: Run the Node checks before an image is released (false for repos without package.json)
+        type: boolean
+        default: true
+      package-manager:
+        description: npm, pnpm (via corepack) or bun
+        type: string
+        default: npm
+      node-version:
+        description: Node version, e.g. 22.23.4. Empty = read node-version-file
+        type: string
+        default: ""
+      node-version-file:
+        description: File with the Node version (used when node-version is empty)
+        type: string
+        default: .node-version
+      bun-version-file:
+        description: File with the bun version (package-manager bun)
+        type: string
+        default: package.json
+      working-directory:
+        description: Directory with package.json and the lockfile
+        type: string
+        default: .
+      scripts:
+        description: package.json scripts to run in this order; missing scripts are skipped
+        type: string
+        default: lint typecheck test
+      db-image:
+        description: Optional Postgres service image for the checks, pinned by digest (see ci-node.yml)
+        type: string
+        default: ""
+      image:
+        description: Image path on ghcr.io. Empty = ghcr.io/<owner>/<repo> in lower case
+        type: string
+        default: ""
+      context:
+        description: Docker build context
+        type: string
+        default: .
+      dockerfile:
+        description: Dockerfile path. Empty = <context>/Dockerfile
+        type: string
+        default: ""
+      target:
+        description: Dockerfile stage to build. Empty = the last stage
+        type: string
+        default: ""
+      platforms:
+        description: Image platforms, e.g. linux/amd64,linux/arm64
+        type: string
+        default: linux/amd64
+      build-args:
+        description: Docker build args, one KEY=value per line (no secrets)
+        type: string
+        default: ""
+      image-smoke-script:
+        description: Optional script in the repo, run as `<script> <image@digest>` after the build
+        type: string
+        default: ""
+      trivy-ignore-unfixed:
+        description: Let Trivy skip HIGH/CRITICAL findings without a fixed version
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  # Routing, the default-branch guard and the lookup of an rc image for this commit.
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # compare API for the default-branch guard
+      actions: read # rc runs of this workflow and their artifacts
+    outputs:
+      environment: ${{ contains(github.ref_name, '-rc.') && 'acceptance' || 'production' }}
+      digest: ${{ steps.rc.outputs.digest }}
+    steps:
+      - name: Production tag must be on the default branch
+        if: ${{ !contains(github.ref_name, '-rc.') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          # identical or behind: the tagged commit is an ancestor of (or equal to) the default branch.
+          status="$(gh api "repos/$GITHUB_REPOSITORY/compare/$DEFAULT_BRANCH...$GITHUB_SHA" --jq .status)"
+          case "$status" in
+            identical|behind) echo "$GITHUB_REF_NAME ($GITHUB_SHA) is on $DEFAULT_BRANCH" ;;
+            *) echo "::error::Tag $GITHUB_REF_NAME is not on $DEFAULT_BRANCH ($status)"; exit 1 ;;
+          esac
+      - name: Image an rc run built for this commit
+        id: rc
+        if: ${{ !contains(github.ref_name, '-rc.') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          # Same commit means the same workflow file, so an rc run of it checked, built and scanned this code.
+          workflow="${WORKFLOW_REF%%@*}"
+          workflow="${workflow##*/}"
+          runs="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?head_sha=$GITHUB_SHA&event=push&per_page=100" \
+            --jq '[.workflow_runs[] | select(.head_branch | test("^[0-9]+\\.[0-9]+\\.[0-9]+-rc\\.[0-9]+$"))] | sort_by(.created_at) | reverse | .[].id')"
+          for run in $runs; do
+            artifact="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts" \
+              --jq '[.artifacts[] | select(.name == "release-image" and (.expired | not))][0].id // empty')"
+            [ -n "$artifact" ] || continue
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact/zip" > "$RUNNER_TEMP/release-image.zip"
+            digest="$(unzip -p "$RUNNER_TEMP/release-image.zip" digest)"
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::release-image artifact of run $run holds no valid digest"
+              exit 1
+            fi
+            echo "Reusing the image of rc run $run: $digest"
+            echo "digest=$digest" >> "$GITHUB_OUTPUT"
+            echo "Reused rc image \`$digest\` from run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          done
+          echo "No rc image for $GITHUB_SHA: checks and a fresh build"
+
+  checks:
+    needs: resolve
+    if: needs.resolve.outputs.digest == '' && inputs.checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    services:
+      postgres:
+        # An empty image starts no service. The caller pins the image by digest; the first step enforces that.
+        image: ${{ inputs.db-image }} # zizmor: ignore[unpinned-images]
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: ${{ inputs.db-image != '' && 'postgresql://postgres:postgres@localhost:5432/test' || '' }}
+    steps:
+      - name: Database image must be pinned by digest
+        if: inputs.db-image != ''
+        env:
+          DB_IMAGE: ${{ inputs.db-image }}
+        run: |
+          [[ "$DB_IMAGE" == *@sha256:* ]] || { echo "::error::db-image must be pinned by digest (image:tag@sha256:...)"; exit 1; }
+      - name: Runner Node to 24.22.1 (Node2Shell, CVE-2026-111497)
+        # JavaScript actions run on the runner's own node24 helper, not on the
+        # Node from setup-node. GitHub-hosted runner 2.338.0 ships 24.21.0 there
+        # (vulnerable). Before the first action: install the official 24.22.1
+        # binary with a fixed checksum, then verify. A newer helper is left alone.
+        env:
+          NODE_VERSION: v24.22.1
+          NODE_SHA256: 6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6
+        run: |
+          set -euo pipefail
+          mapfile -t helpers < <(find /home/runner/actions-runner /opt/runner-cache -path '*/externals/node24/bin/node' -type f 2>/dev/null)
+          if [ "${#helpers[@]}" -eq 0 ]; then
+            echo "::error::no node24 helper found in the runner"
+            exit 1
+          fi
+          dist="node-${NODE_VERSION}-linux-x64"
+          curl -sSfL "https://nodejs.org/dist/${NODE_VERSION}/${dist}.tar.xz" -o "$RUNNER_TEMP/node.tar.xz"
+          echo "${NODE_SHA256}  $RUNNER_TEMP/node.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/node.tar.xz" -C "$RUNNER_TEMP" "${dist}/bin/node"
+          for helper in "${helpers[@]}"; do
+            current=$("$helper" -v)
+            if [ "$(printf '%s\n' "$NODE_VERSION" "$current" | sort -V | head -1)" != "$NODE_VERSION" ]; then
+              if [ -w "$helper" ]; then
+                install -m 0755 "$RUNNER_TEMP/${dist}/bin/node" "$helper"
+              else
+                sudo install -m 0755 "$RUNNER_TEMP/${dist}/bin/node" "$helper"
+              fi
+            fi
+            after=$("$helper" -v)
+            echo "$helper: $current -> $after"
+            if [ "$(printf '%s\n' "$NODE_VERSION" "$after" | sort -V | head -1)" != "$NODE_VERSION" ]; then
+              echo "::error::$helper is $after, need >= $NODE_VERSION"
+              exit 1
+            fi
+          done
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Enable pnpm via corepack
+        if: inputs.package-manager == 'pnpm'
+        run: corepack enable
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: inputs.package-manager != 'bun'
+        with:
+          node-version: ${{ inputs.node-version }}
+          node-version-file: ${{ inputs.node-version == '' && inputs.node-version-file || '' }}
+          package-manager-cache: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        if: inputs.package-manager == 'bun'
+        with:
+          bun-version-file: ${{ inputs.bun-version-file }}
+      - name: Install dependencies
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PM: ${{ inputs.package-manager }}
+        run: |
+          set -euo pipefail
+          case "$PM" in
+            npm) npm ci --no-audit --no-fund ;;
+            pnpm) pnpm install --frozen-lockfile ;;
+            bun) bun install --frozen-lockfile ;;
+            *) echo "::error::Unknown package-manager '$PM' (npm, pnpm or bun)"; exit 1 ;;
+          esac
+      - name: Lint, typecheck and test (package.json scripts that exist)
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PM: ${{ inputs.package-manager }}
+          SCRIPTS: ${{ inputs.scripts }}
+        run: |
+          set -euo pipefail
+          for script in $SCRIPTS; do
+            if jq -e --arg s "$script" '.scripts[$s]' package.json > /dev/null; then
+              echo "::group::$PM run $script"
+              "$PM" run "$script"
+              echo "::endgroup::"
+            else
+              echo "No script '$script' in package.json, skipped"
+            fi
+          done
+
+  # Runs next to checks; the image only gets its release tags once checks and Trivy pass.
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.digest == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Runner Node to 24.22.1 (Node2Shell, CVE-2026-111497)
+        # JavaScript actions run on the runner's own node24 helper, not on the
+        # Node from setup-node. GitHub-hosted runner 2.338.0 ships 24.21.0 there
+        # (vulnerable). Before the first action: install the official 24.22.1
+        # binary with a fixed checksum, then verify. A newer helper is left alone.
+        env:
+          NODE_VERSION: v24.22.1
+          NODE_SHA256: 6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6
+        run: |
+          set -euo pipefail
+          mapfile -t helpers < <(find /home/runner/actions-runner /opt/runner-cache -path '*/externals/node24/bin/node' -type f 2>/dev/null)
+          if [ "${#helpers[@]}" -eq 0 ]; then
+            echo "::error::no node24 helper found in the runner"
+            exit 1
+          fi
+          dist="node-${NODE_VERSION}-linux-x64"
+          curl -sSfL "https://nodejs.org/dist/${NODE_VERSION}/${dist}.tar.xz" -o "$RUNNER_TEMP/node.tar.xz"
+          echo "${NODE_SHA256}  $RUNNER_TEMP/node.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/node.tar.xz" -C "$RUNNER_TEMP" "${dist}/bin/node"
+          for helper in "${helpers[@]}"; do
+            current=$("$helper" -v)
+            if [ "$(printf '%s\n' "$NODE_VERSION" "$current" | sort -V | head -1)" != "$NODE_VERSION" ]; then
+              if [ -w "$helper" ]; then
+                install -m 0755 "$RUNNER_TEMP/${dist}/bin/node" "$helper"
+              else
+                sudo install -m 0755 "$RUNNER_TEMP/${dist}/bin/node" "$helper"
+              fi
+            fi
+            after=$("$helper" -v)
+            echo "$helper: $current -> $after"
+            if [ "$(printf '%s\n' "$NODE_VERSION" "$after" | sort -V | head -1)" != "$NODE_VERSION" ]; then
+              echo "::error::$helper is $after, need >= $NODE_VERSION"
+              exit 1
+            fi
+          done
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Image name
+        env:
+          IMAGE_INPUT: ${{ inputs.image }}
+        run: echo "IMAGE=${IMAGE_INPUT:-ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')}" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Fresh base and no layer cache: a release must contain the current base image and packages.
+      - id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          target: ${{ inputs.target }}
+          platforms: ${{ inputs.platforms }}
+          build-args: ${{ inputs.build-args }}
+          pull: true
+          no-cache: true
+          push: true
+          tags: ${{ env.IMAGE }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+      - name: Smoke test the pushed image
+        if: inputs.image-smoke-script != ''
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          SCRIPT: ${{ inputs.image-smoke-script }}
+        run: |
+          set -euo pipefail
+          docker pull --quiet "$IMAGE@$DIGEST"
+          "./$SCRIPT" "$IMAGE@$DIGEST"
+
+  # Trivy on the digest (also on a reused rc image: new CVEs since the rc count), then the release tags.
+  image:
+    needs: [resolve, checks, build]
+    if: >-
+      !cancelled() && needs.resolve.result == 'success' &&
+      (needs.resolve.outputs.digest != '' ||
+       (needs.build.result == 'success' && (needs.checks.result == 'success' || (!inputs.checks && needs.checks.result == 'skipped'))))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read # .trivyignore
+      packages: write
+    env:
+      DIGEST: ${{ needs.resolve.outputs.digest || needs.build.outputs.digest }}
+      CHANNEL: ${{ needs.resolve.outputs.environment == 'acceptance' && 'acc' || 'latest' }}
+    steps:
+      - name: Runner Node to 24.22.1 (Node2Shell, CVE-2026-111497)
+        # JavaScript actions run on the runner's own node24 helper, not on the
+        # Node from setup-node. GitHub-hosted runner 2.338.0 ships 24.21.0 there
+        # (vulnerable). Before the first action: install the official 24.22.1
+        # binary with a fixed checksum, then verify. A newer helper is left alone.
+        env:
+          NODE_VERSION: v24.22.1
+          NODE_SHA256: 6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6
+        run: |
+          set -euo pipefail
+          mapfile -t helpers < <(find /home/runner/actions-runner /opt/runner-cache -path '*/externals/node24/bin/node' -type f 2>/dev/null)
+          if [ "${#helpers[@]}" -eq 0 ]; then
+            echo "::error::no node24 helper found in the runner"
+            exit 1
+          fi
+          dist="node-${NODE_VERSION}-linux-x64"
+          curl -sSfL "https://nodejs.org/dist/${NODE_VERSION}/${dist}.tar.xz" -o "$RUNNER_TEMP/node.tar.xz"
+          echo "${NODE_SHA256}  $RUNNER_TEMP/node.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/node.tar.xz" -C "$RUNNER_TEMP" "${dist}/bin/node"
+          for helper in "${helpers[@]}"; do
+            current=$("$helper" -v)
+            if [ "$(printf '%s\n' "$NODE_VERSION" "$current" | sort -V | head -1)" != "$NODE_VERSION" ]; then
+              if [ -w "$helper" ]; then
+                install -m 0755 "$RUNNER_TEMP/${dist}/bin/node" "$helper"
+              else
+                sudo install -m 0755 "$RUNNER_TEMP/${dist}/bin/node" "$helper"
+              fi
+            fi
+            after=$("$helper" -v)
+            echo "$helper: $current -> $after"
+            if [ "$(printf '%s\n' "$NODE_VERSION" "$after" | sort -V | head -1)" != "$NODE_VERSION" ]; then
+              echo "::error::$helper is $after, need >= $NODE_VERSION"
+              exit 1
+            fi
+          done
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: .trivyignore
+          sparse-checkout-cone-mode: false
+      - name: Image name and registry login
+        env:
+          IMAGE_INPUT: ${{ inputs.image }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          echo "IMAGE=${IMAGE_INPUT:-ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')}" >> "$GITHUB_ENV"
+          printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+      - name: Trivy scan of the image (HIGH/CRITICAL blocks)
+        env:
+          TRIVY_VERSION: 0.76.1
+          TRIVY_SHA256: c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+          IGNORE_UNFIXED: ${{ inputs.trivy-ignore-unfixed }}
+        run: |
+          set -euo pipefail
+          args=(--quiet --severity "HIGH,CRITICAL" --exit-code 1)
+          [ "$IGNORE_UNFIXED" = true ] && args+=(--ignore-unfixed)
+          [ -f .trivyignore ] && args+=(--ignorefile "$GITHUB_WORKSPACE/.trivyignore")
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum -c - && tar -xzf trivy.tgz trivy
+          ./trivy image "${args[@]}" "$IMAGE@$DIGEST"
+      - name: Promote to the version tag and the channel
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create -t "$IMAGE:$GITHUB_REF_NAME" -t "$IMAGE:$CHANNEL" "$IMAGE@$DIGEST"
+          echo "Image \`$IMAGE@$DIGEST\` (revision \`$GITHUB_SHA\`) as :$GITHUB_REF_NAME and :$CHANNEL" >> "$GITHUB_STEP_SUMMARY"
+      # Proof for a later prod tag on this commit: checks, build and Trivy passed for this digest.
+      - name: Record the digest
+        if: needs.resolve.outputs.digest == ''
+        run: printf '%s' "$DIGEST" > "$RUNNER_TEMP/digest"
+      - if: needs.resolve.outputs.digest == ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-image
+          path: ${{ runner.temp }}/digest
+          retention-days: 90
+          if-no-files-found: error
+
+  deploy:
+    needs: [resolve, image]
+    if: ${{ !cancelled() && needs.image.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions: {}
+    environment: ${{ needs.resolve.outputs.environment }}
+    outputs:
+      live_url: ${{ steps.live.outputs.url }}
+    steps:
+      - name: Dokploy webhooks
+        env:
+          WEBHOOK_URLS: ${{ secrets.DOKPLOY_WEBHOOK_URLS }}
+          WEBHOOK_URL: ${{ secrets.DOKPLOY_WEBHOOK_URL }}
+        run: |
+          urls="${WEBHOOK_URLS:-$WEBHOOK_URL}"
+          [ -n "$urls" ] || { echo "::error::Neither DOKPLOY_WEBHOOK_URLS nor DOKPLOY_WEBHOOK_URL is set in this environment"; exit 1; }
+          n=0
+          while IFS= read -r url || [ -n "$url" ]; do
+            url="$(printf '%s' "$url" | tr -d '[:space:]')"
+            [ -n "$url" ] || continue
+            n=$((n + 1))
+            echo "Webhook $n"
+            curl -fsS --retry 3 --retry-delay 5 -X POST "$url" -o /dev/null || { echo "::error::Webhook $n failed"; exit 1; }
+          done <<< "$urls"
+          [ "$n" -gt 0 ] || { echo "::error::No webhook URL found"; exit 1; }
+      # A reusable-workflow job cannot use an environment, so hand the environment's LIVE_URL on.
+      - id: live
+        env:
+          LIVE_URL: ${{ vars.LIVE_URL }}
+        run: echo "url=${LIVE_URL}" >> "$GITHUB_OUTPUT"
+
+  # A green webhook only means Dokploy accepted the request; nuclei checks the live URL.
+  smoke:
+    needs: deploy
+    if: ${{ !cancelled() && needs.deploy.result == 'success' && needs.deploy.outputs.live_url != '' }}
+    permissions:
+      contents: read
+    uses: indicia-AI-lab/.github/.github/workflows/nuclei.yml@057cf17e9fdeae9b20db7d83ba72aa844051ff51 # v1.0.4
+    with:
+      url: ${{ needs.deploy.outputs.live_url }}

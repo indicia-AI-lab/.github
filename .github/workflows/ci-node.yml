@@ -1,0 +1,155 @@
+name: ci-node
+
+# Reusable CI for Node projects (family A: Node + Dockerfile + Dokploy, and image-only repos).
+# Caller (.github/workflows/ci.yml), with concurrency and permissions set there:
+#   on: { pull_request: {}, push: { branches: [main] } }
+#   permissions: {}
+#   concurrency: { group: ${{ github.workflow }}-${{ github.ref }}, cancel-in-progress: true }
+#   jobs:
+#     ci:
+#       permissions: { contents: read }
+#       uses: <org>/.github/.github/workflows/ci-node.yml@<sha> # vX.Y.Z
+#       with: { node-version: "22.23.4" }
+# The package manager cache is on: this workflow publishes nothing. release-dokploy.yml runs the
+# same checks without a cache.
+on:
+  workflow_call:
+    inputs:
+      package-manager:
+        description: npm, pnpm (via corepack) or bun
+        type: string
+        default: npm
+      node-version:
+        description: Node version, e.g. 22.23.4. Empty = read node-version-file
+        type: string
+        default: ""
+      node-version-file:
+        description: File with the Node version (used when node-version is empty)
+        type: string
+        default: .node-version
+      bun-version-file:
+        description: File with the bun version (package-manager bun)
+        type: string
+        default: package.json
+      working-directory:
+        description: Directory with package.json and the lockfile
+        type: string
+        default: .
+      scripts:
+        description: package.json scripts to run in this order; missing scripts are skipped
+        type: string
+        default: lint typecheck test
+      db-image:
+        description: >-
+          Optional Postgres service image (pin it by digest). Tests get DATABASE_URL=postgresql://postgres:postgres@localhost:5432/test.
+          Empty = no database.
+        type: string
+        default: ""
+
+permissions: {}
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    services:
+      postgres:
+        # An empty image starts no service. The caller pins the image by digest; the first step enforces that.
+        image: ${{ inputs.db-image }} # zizmor: ignore[unpinned-images]
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: ${{ inputs.db-image != '' && 'postgresql://postgres:postgres@localhost:5432/test' || '' }}
+    steps:
+      - name: Database image must be pinned by digest
+        if: inputs.db-image != ''
+        env:
+          DB_IMAGE: ${{ inputs.db-image }}
+        run: |
+          [[ "$DB_IMAGE" == *@sha256:* ]] || { echo "::error::db-image must be pinned by digest (image:tag@sha256:...)"; exit 1; }
+      - name: Runner Node to 24.22.1 (Node2Shell, CVE-2026-111497)
+        # JavaScript actions run on the runner's own node24 helper, not on the
+        # Node from setup-node. GitHub-hosted runner 2.338.0 ships 24.21.0 there
+        # (vulnerable). Before the first action: install the official 24.22.1
+        # binary with a fixed checksum, then verify. A newer helper is left alone.
+        env:
+          NODE_VERSION: v24.22.1
+          NODE_SHA256: 6c172a9ab6718f7b801fb5a7bd486af2ee5e32758086a04b84fcce2aa77095e6
+        run: |
+          set -euo pipefail
+          mapfile -t helpers < <(find /home/runner/actions-runner /opt/runner-cache -path '*/externals/node24/bin/node' -type f 2>/dev/null)
+          if [ "${#helpers[@]}" -eq 0 ]; then
+            echo "::error::no node24 helper found in the runner"
+            exit 1
+          fi
+          dist="node-${NODE_VERSION}-linux-x64"
+          curl -sSfL "https://nodejs.org/dist/${NODE_VERSION}/${dist}.tar.xz" -o "$RUNNER_TEMP/node.tar.xz"
+          echo "${NODE_SHA256}  $RUNNER_TEMP/node.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/node.tar.xz" -C "$RUNNER_TEMP" "${dist}/bin/node"
+          for helper in "${helpers[@]}"; do
+            current=$("$helper" -v)
+            if [ "$(printf '%s\n' "$NODE_VERSION" "$current" | sort -V | head -1)" != "$NODE_VERSION" ]; then
+              if [ -w "$helper" ]; then
+                install -m 0755 "$RUNNER_TEMP/${dist}/bin/node" "$helper"
+              else
+                sudo install -m 0755 "$RUNNER_TEMP/${dist}/bin/node" "$helper"
+              fi
+            fi
+            after=$("$helper" -v)
+            echo "$helper: $current -> $after"
+            if [ "$(printf '%s\n' "$NODE_VERSION" "$after" | sort -V | head -1)" != "$NODE_VERSION" ]; then
+              echo "::error::$helper is $after, need >= $NODE_VERSION"
+              exit 1
+            fi
+          done
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Enable pnpm via corepack
+        if: inputs.package-manager == 'pnpm'
+        run: corepack enable
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        if: inputs.package-manager != 'bun'
+        with:
+          node-version: ${{ inputs.node-version }}
+          node-version-file: ${{ inputs.node-version == '' && inputs.node-version-file || '' }}
+          cache: ${{ inputs.package-manager }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        if: inputs.package-manager == 'bun'
+        with:
+          bun-version-file: ${{ inputs.bun-version-file }}
+      - name: Install dependencies
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PM: ${{ inputs.package-manager }}
+        run: |
+          set -euo pipefail
+          case "$PM" in
+            npm) npm ci --no-audit --no-fund ;;
+            pnpm) pnpm install --frozen-lockfile ;;
+            bun) bun install --frozen-lockfile ;;
+            *) echo "::error::Unknown package-manager '$PM' (npm, pnpm or bun)"; exit 1 ;;
+          esac
+      - name: Lint, typecheck and test (package.json scripts that exist)
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PM: ${{ inputs.package-manager }}
+          SCRIPTS: ${{ inputs.scripts }}
+        run: |
+          set -euo pipefail
+          for script in $SCRIPTS; do
+            if jq -e --arg s "$script" '.scripts[$s]' package.json > /dev/null; then
+              echo "::group::$PM run $script"
+              "$PM" run "$script"
+              echo "::endgroup::"
+            else
+              echo "No script '$script' in package.json, skipped"
+            fi
+          done
