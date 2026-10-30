@@ -22,14 +22,20 @@ name: release-dokploy
 #       uses: <org>/.github/.github/workflows/release-dokploy.yml@<sha> # vX.Y.Z
 #       secrets: inherit # zizmor: ignore[secrets-inherit] environment secrets reach a reusable workflow only this way
 #       with: { node-version: "22.23.4" }
+# Python with uv: `with: { runtime: python, python-checks: ruff ruff-format pyright pytest }`; the checks
+# job then runs the steps of ci-python.yml instead of the Node steps. Other check inputs as in ci-node.yml.
 # Repo setup: environments `acceptance` (tags `*-rc*`) and `production` (tags `[0-9]*`), each with
 # secret DOKPLOY_WEBHOOK_URLS (one URL per line, fired in order) or DOKPLOY_WEBHOOK_URL and variable
 # LIVE_URL. An environment without a webhook ends red on purpose: that environment does not exist.
 on:
   workflow_call:
     inputs:
+      runtime:
+        description: Checks for node (ci-node.yml) or python (ci-python.yml, uv)
+        type: string
+        default: node
       checks:
-        description: Run the Node checks before an image is released (false for repos without package.json)
+        description: Run the checks before an image is released (false for repos without package.json or pyproject.toml)
         type: boolean
         default: true
       package-manager:
@@ -60,10 +66,60 @@ on:
         description: Extra shell commands after the scripts, in working-directory (e.g. `npm run test:map -- sample.xml`)
         type: string
         default: ""
+      install-command:
+        description: Replaces the Node install step, e.g. `npm ci --legacy-peer-deps`
+        type: string
+        default: ""
+      apt-packages:
+        description: Ubuntu packages for the checks, space separated (e.g. `libxml2-utils poppler-utils`)
+        type: string
+        default: ""
       db-image:
         description: Optional Postgres service image for the checks, pinned by digest (see ci-node.yml)
         type: string
         default: ""
+      db-user:
+        description: User of the throwaway CI database (no secret)
+        type: string
+        default: postgres
+      db-password:
+        description: Password of the throwaway CI database (no secret)
+        type: string
+        default: postgres
+      db-name:
+        description: Name of the throwaway CI database
+        type: string
+        default: test
+      db-url-env:
+        description: Variables that get the database URL, space separated (e.g. `DATABASE_URL TEST_DATABASE_URL`)
+        type: string
+        default: DATABASE_URL
+      env:
+        description: >-
+          Extra environment for install and checks, one KEY=value per line (no secrets). Set after the database URL,
+          so it can override it (e.g. DATABASE_URL=postgresql+asyncpg://...).
+        type: string
+        default: ""
+      python-version:
+        description: runtime python. Python version, e.g. 3.13. Empty = read python-version-file
+        type: string
+        default: ""
+      python-version-file:
+        description: runtime python. File with the Python version, in working-directory
+        type: string
+        default: .python-version
+      uv-version:
+        description: runtime python. uv version
+        type: string
+        default: 0.13.1
+      all-extras:
+        description: runtime python. uv sync --all-extras
+        type: boolean
+        default: false
+      python-checks:
+        description: runtime python. Checks in this order (see `checks` in ci-python.yml)
+        type: string
+        default: ruff pytest
       image:
         description: Image path on ghcr.io. Empty = ghcr.io/<owner>/<repo> in lower case
         type: string
@@ -170,21 +226,32 @@ jobs:
         # An empty image starts no service. The caller pins the image by digest; the first step enforces that.
         image: ${{ inputs.db-image }} # zizmor: ignore[unpinned-images]
         env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: test
+          POSTGRES_USER: ${{ inputs.db-user }}
+          POSTGRES_PASSWORD: ${{ inputs.db-password }}
+          POSTGRES_DB: ${{ inputs.db-name }}
+          PGUSER: ${{ inputs.db-user }} # for pg_isready
         ports: ["5432:5432"]
         options: >-
-          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
-    env:
-      DATABASE_URL: ${{ inputs.db-image != '' && 'postgresql://postgres:postgres@localhost:5432/test' || '' }}
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
-      - name: Database image must be pinned by digest
+      - name: Runtime is node or python
+        if: inputs.runtime != 'node' && inputs.runtime != 'python'
+        run: |
+          echo "::error::runtime must be node or python"
+          exit 1
+      - name: Database image pinned by digest, URL-safe credentials
         if: inputs.db-image != ''
         env:
           DB_IMAGE: ${{ inputs.db-image }}
+          DB_USER: ${{ inputs.db-user }}
+          DB_PASSWORD: ${{ inputs.db-password }}
+          DB_NAME: ${{ inputs.db-name }}
         run: |
           [[ "$DB_IMAGE" == *@sha256:* ]] || { echo "::error::db-image must be pinned by digest (image:tag@sha256:...)"; exit 1; }
+          safe='^[A-Za-z0-9._~-]+$'
+          for value in "$DB_USER" "$DB_PASSWORD" "$DB_NAME"; do
+            [[ "$value" =~ $safe ]] || { echo "::error::db-user, db-password and db-name may only hold A-Z a-z 0-9 . _ ~ -"; exit 1; }
+          done
       - name: Runner Node to 24.22.1 (Node2Shell, CVE-2026-111497)
         # JavaScript actions run on the runner's own node24 helper, not on the
         # Node from setup-node. GitHub-hosted runner 2.338.0 ships 24.21.0 there
@@ -224,24 +291,89 @@ jobs:
         with:
           persist-credentials: false
       - name: Enable pnpm via corepack
-        if: inputs.package-manager == 'pnpm'
+        if: inputs.runtime == 'node' && inputs.package-manager == 'pnpm'
         run: corepack enable
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        if: inputs.package-manager != 'bun'
+        if: inputs.runtime == 'node' && inputs.package-manager != 'bun'
         with:
           node-version: ${{ inputs.node-version }}
           node-version-file: ${{ inputs.node-version == '' && inputs.node-version-file || '' }}
           package-manager-cache: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-        if: inputs.package-manager == 'bun'
+        if: inputs.runtime == 'node' && inputs.package-manager == 'bun'
         with:
           bun-version-file: ${{ inputs.bun-version-file }}
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        if: inputs.runtime == 'python'
+        with:
+          version: ${{ inputs.uv-version }}
+          enable-cache: false
+      - name: Python version
+        if: inputs.runtime == 'python'
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          PYTHON_VERSION: ${{ inputs.python-version }}
+          PYTHON_VERSION_FILE: ${{ inputs.python-version-file }}
+        run: |
+          set -euo pipefail
+          version="$PYTHON_VERSION"
+          if [ -z "$version" ]; then
+            [ -f "$PYTHON_VERSION_FILE" ] || { echo "::error::Set python-version or add $PYTHON_VERSION_FILE"; exit 1; }
+            version="$(head -n 1 "$PYTHON_VERSION_FILE" | tr -d '[:space:]')"
+          fi
+          [[ "$version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || { echo "::error::Python version '$version' is not X.Y or X.Y.Z"; exit 1; }
+          echo "UV_PYTHON=$version" >> "$GITHUB_ENV"
+      - name: System packages
+        if: inputs.apt-packages != ''
+        env:
+          APT_PACKAGES: ${{ inputs.apt-packages }}
+        run: |
+          set -euo pipefail
+          names='^[a-z0-9][a-z0-9.+-]*( [a-z0-9][a-z0-9.+-]*)*$'
+          [[ "$APT_PACKAGES" =~ $names ]] || { echo "::error::apt-packages must be package names separated by single spaces"; exit 1; }
+          read -ra packages <<< "$APT_PACKAGES"
+          sudo apt-get update -q && sudo apt-get install -y --no-install-recommends "${packages[@]}"
+      # After the actions and before the install: install, scripts and extra commands see these variables.
+      - name: Test database URL and environment
+        if: inputs.db-image != '' || inputs.env != ''
+        env:
+          DB_URL: ${{ inputs.db-image != '' && format('postgresql://{0}:{1}@localhost:5432/{2}', inputs.db-user, inputs.db-password, inputs.db-name) || '' }}
+          DB_URL_ENV: ${{ inputs.db-url-env }}
+          ENV_LINES: ${{ inputs.env }}
+        run: |
+          set -euo pipefail
+          key_re='^[A-Z_][A-Z0-9_]*$'
+          if [ -n "$DB_URL" ]; then
+            for key in $DB_URL_ENV; do
+              [[ "$key" =~ $key_re ]] || { echo "::error::db-url-env: '$key' is no valid variable name"; exit 1; }
+              printf '%s=%s\n' "$key" "$DB_URL" >> "$GITHUB_ENV"
+              echo "$key: database URL"
+            done
+          fi
+          while IFS= read -r line || [ -n "$line" ]; do
+            [ -n "${line//[[:space:]]/}" ] || continue
+            key="${line%%=*}"
+            if [[ "$line" != *=* || ! "$key" =~ $key_re ]]; then
+              echo "::error::env: every line must be KEY=value with KEY matching $key_re"
+              exit 1
+            fi
+            # One line is one variable: no carriage return that could start a second one.
+            [[ "$line" != *$'\r'* ]] || { echo "::error::env: $key holds a line break"; exit 1; }
+            printf '%s\n' "$line" >> "$GITHUB_ENV"
+            echo "$key: set"
+          done <<< "$ENV_LINES"
       - name: Install dependencies
+        if: inputs.runtime == 'node'
         working-directory: ${{ inputs.working-directory }}
         env:
           PM: ${{ inputs.package-manager }}
+          INSTALL: ${{ inputs.install-command }}
         run: |
           set -euo pipefail
+          if [ -n "$INSTALL" ]; then
+            bash -euo pipefail -c "$INSTALL"
+            exit 0
+          fi
           case "$PM" in
             npm) npm ci --no-audit --no-fund ;;
             pnpm) pnpm install --frozen-lockfile ;;
@@ -249,6 +381,7 @@ jobs:
             *) echo "::error::Unknown package-manager '$PM' (npm, pnpm or bun)"; exit 1 ;;
           esac
       - name: Lint, typecheck and test (package.json scripts that exist)
+        if: inputs.runtime == 'node'
         working-directory: ${{ inputs.working-directory }}
         env:
           PM: ${{ inputs.package-manager }}
@@ -264,10 +397,41 @@ jobs:
               echo "No script '$script' in package.json, skipped"
             fi
           done
+      - name: Install dependencies (uv)
+        if: inputs.runtime == 'python'
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          ALL_EXTRAS: ${{ inputs.all-extras }}
+        run: |
+          set -euo pipefail
+          args=(--frozen)
+          [ "$ALL_EXTRAS" = true ] && args+=(--all-extras)
+          uv sync "${args[@]}"
+      - name: Python checks
+        if: inputs.runtime == 'python'
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          UV_FROZEN: "1"
+          CHECKS: ${{ inputs.python-checks }}
+        run: |
+          set -euo pipefail
+          for check in $CHECKS; do
+            echo "::group::$check"
+            case "$check" in
+              ruff) uv run ruff check . ;;
+              ruff-format) uv run ruff format --check . ;;
+              pyright) uv run pyright ;;
+              pytest) uv run pytest ;;
+              bandit) uvx bandit==1.9.4 -r . -lll -x ./.venv,./tests ;;
+              *) echo "::error::Unknown check '$check' (ruff, ruff-format, pyright, pytest or bandit)"; exit 1 ;;
+            esac
+            echo "::endgroup::"
+          done
       - name: Extra check commands
         if: inputs.extra-commands != ''
         working-directory: ${{ inputs.working-directory }}
         env:
+          UV_FROZEN: "1" # runtime python: uv run never relocks
           EXTRA: ${{ inputs.extra-commands }}
         run: bash -euo pipefail -c "$EXTRA"
 

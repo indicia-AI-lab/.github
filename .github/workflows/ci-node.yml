@@ -10,6 +10,8 @@ name: ci-node
 #       permissions: { contents: read }
 #       uses: <org>/.github/.github/workflows/ci-node.yml@<sha> # vX.Y.Z
 #       with: { node-version: "22.23.4" }
+# Scripts with arguments: put them in extra-commands, e.g. `npm run test:map -- sample.xml`.
+# Repo without a lockfile: `lockfile: package.json` and `install-command: npm install --no-audit --no-fund`.
 # The package manager cache is on: this workflow publishes nothing. release-dokploy.yml runs the
 # same checks without a cache.
 on:
@@ -43,10 +45,44 @@ on:
         description: Extra shell commands after the scripts, in working-directory (e.g. `npm run test:map -- sample.xml`)
         type: string
         default: ""
+      lockfile:
+        description: Lockfile path for the cache key, from the repo root. Empty = <working-directory>/*-lock.*
+        type: string
+        default: ""
+      install-command:
+        description: Replaces the install step, e.g. `npm ci --legacy-peer-deps`. Empty = npm ci / pnpm or bun install --frozen-lockfile
+        type: string
+        default: ""
+      apt-packages:
+        description: Ubuntu packages for the checks, space separated (e.g. `libxml2-utils poppler-utils`)
+        type: string
+        default: ""
       db-image:
         description: >-
-          Optional Postgres service image (pin it by digest). Tests get DATABASE_URL=postgresql://postgres:postgres@localhost:5432/test.
-          Empty = no database.
+          Optional Postgres service image (pin it by digest). Tests get postgresql://<db-user>:<db-password>@localhost:5432/<db-name>
+          in every variable of db-url-env. Empty = no database.
+        type: string
+        default: ""
+      db-user:
+        description: User of the throwaway CI database (no secret)
+        type: string
+        default: postgres
+      db-password:
+        description: Password of the throwaway CI database (no secret)
+        type: string
+        default: postgres
+      db-name:
+        description: Name of the throwaway CI database
+        type: string
+        default: test
+      db-url-env:
+        description: Variables that get the database URL, space separated (e.g. `DATABASE_URL TEST_DATABASE_URL`)
+        type: string
+        default: DATABASE_URL
+      env:
+        description: >-
+          Extra environment for install and checks, one KEY=value per line (no secrets). Set after the database URL,
+          so it can override it (e.g. DATABASE_URL=postgresql+asyncpg://...).
         type: string
         default: ""
 
@@ -63,21 +99,27 @@ jobs:
         # An empty image starts no service. The caller pins the image by digest; the first step enforces that.
         image: ${{ inputs.db-image }} # zizmor: ignore[unpinned-images]
         env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: test
+          POSTGRES_USER: ${{ inputs.db-user }}
+          POSTGRES_PASSWORD: ${{ inputs.db-password }}
+          POSTGRES_DB: ${{ inputs.db-name }}
+          PGUSER: ${{ inputs.db-user }} # for pg_isready
         ports: ["5432:5432"]
         options: >-
-          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
-    env:
-      DATABASE_URL: ${{ inputs.db-image != '' && 'postgresql://postgres:postgres@localhost:5432/test' || '' }}
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
-      - name: Database image must be pinned by digest
+      - name: Database image pinned by digest, URL-safe credentials
         if: inputs.db-image != ''
         env:
           DB_IMAGE: ${{ inputs.db-image }}
+          DB_USER: ${{ inputs.db-user }}
+          DB_PASSWORD: ${{ inputs.db-password }}
+          DB_NAME: ${{ inputs.db-name }}
         run: |
           [[ "$DB_IMAGE" == *@sha256:* ]] || { echo "::error::db-image must be pinned by digest (image:tag@sha256:...)"; exit 1; }
+          safe='^[A-Za-z0-9._~-]+$'
+          for value in "$DB_USER" "$DB_PASSWORD" "$DB_NAME"; do
+            [[ "$value" =~ $safe ]] || { echo "::error::db-user, db-password and db-name may only hold A-Z a-z 0-9 . _ ~ -"; exit 1; }
+          done
       - name: Runner Node to 24.22.1 (Node2Shell, CVE-2026-111497)
         # JavaScript actions run on the runner's own node24 helper, not on the
         # Node from setup-node. GitHub-hosted runner 2.338.0 ships 24.21.0 there
@@ -124,18 +166,62 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
           node-version-file: ${{ inputs.node-version == '' && inputs.node-version-file || '' }}
-          cache-dependency-path: ${{ inputs.working-directory }}/*-lock.*
+          cache-dependency-path: ${{ inputs.lockfile || format('{0}/*-lock.*', inputs.working-directory) }}
           cache: ${{ inputs.package-manager }}
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         if: inputs.package-manager == 'bun'
         with:
           bun-version-file: ${{ inputs.bun-version-file }}
+      - name: System packages
+        if: inputs.apt-packages != ''
+        env:
+          APT_PACKAGES: ${{ inputs.apt-packages }}
+        run: |
+          set -euo pipefail
+          names='^[a-z0-9][a-z0-9.+-]*( [a-z0-9][a-z0-9.+-]*)*$'
+          [[ "$APT_PACKAGES" =~ $names ]] || { echo "::error::apt-packages must be package names separated by single spaces"; exit 1; }
+          read -ra packages <<< "$APT_PACKAGES"
+          sudo apt-get update -q && sudo apt-get install -y --no-install-recommends "${packages[@]}"
+      # After the actions and before the install: install, scripts and extra commands see these variables.
+      - name: Test database URL and environment
+        if: inputs.db-image != '' || inputs.env != ''
+        env:
+          DB_URL: ${{ inputs.db-image != '' && format('postgresql://{0}:{1}@localhost:5432/{2}', inputs.db-user, inputs.db-password, inputs.db-name) || '' }}
+          DB_URL_ENV: ${{ inputs.db-url-env }}
+          ENV_LINES: ${{ inputs.env }}
+        run: |
+          set -euo pipefail
+          key_re='^[A-Z_][A-Z0-9_]*$'
+          if [ -n "$DB_URL" ]; then
+            for key in $DB_URL_ENV; do
+              [[ "$key" =~ $key_re ]] || { echo "::error::db-url-env: '$key' is no valid variable name"; exit 1; }
+              printf '%s=%s\n' "$key" "$DB_URL" >> "$GITHUB_ENV"
+              echo "$key: database URL"
+            done
+          fi
+          while IFS= read -r line || [ -n "$line" ]; do
+            [ -n "${line//[[:space:]]/}" ] || continue
+            key="${line%%=*}"
+            if [[ "$line" != *=* || ! "$key" =~ $key_re ]]; then
+              echo "::error::env: every line must be KEY=value with KEY matching $key_re"
+              exit 1
+            fi
+            # One line is one variable: no carriage return that could start a second one.
+            [[ "$line" != *$'\r'* ]] || { echo "::error::env: $key holds a line break"; exit 1; }
+            printf '%s\n' "$line" >> "$GITHUB_ENV"
+            echo "$key: set"
+          done <<< "$ENV_LINES"
       - name: Install dependencies
         working-directory: ${{ inputs.working-directory }}
         env:
           PM: ${{ inputs.package-manager }}
+          INSTALL: ${{ inputs.install-command }}
         run: |
           set -euo pipefail
+          if [ -n "$INSTALL" ]; then
+            bash -euo pipefail -c "$INSTALL"
+            exit 0
+          fi
           case "$PM" in
             npm) npm ci --no-audit --no-fund ;;
             pnpm) pnpm install --frozen-lockfile ;;
