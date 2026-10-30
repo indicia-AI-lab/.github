@@ -10,8 +10,9 @@ on:
 
 permissions: {}
 
+# A newer push to the same PR or branch cancels the older run. Never copy this into tag or deploy workflows.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -27,8 +28,10 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .node-version
-          package-manager-cache: false
-      # pnpm: corepack enable && pnpm install --frozen-lockfile; bun: use oven-sh/setup-bun pinned by SHA.
+          # npm cache: fine here, this workflow publishes nothing. Never in release or deploy workflows
+          # (cache poisoning). pnpm: run `corepack enable` before this step and use `cache: pnpm`.
+          cache: npm
+      # pnpm: pnpm install --frozen-lockfile; bun: use oven-sh/setup-bun pinned by SHA.
       - run: npm ci --no-audit --no-fund
       - run: npm audit --audit-level=high --omit=dev
       - run: npm run lint --if-present
