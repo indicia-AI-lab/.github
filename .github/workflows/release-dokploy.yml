@@ -56,6 +56,10 @@ on:
         description: package.json scripts to run in this order; missing scripts are skipped
         type: string
         default: lint typecheck test
+      extra-commands:
+        description: Extra shell commands after the scripts, in working-directory (e.g. `npm run test:map -- sample.xml`)
+        type: string
+        default: ""
       db-image:
         description: Optional Postgres service image for the checks, pinned by digest (see ci-node.yml)
         type: string
@@ -86,6 +90,10 @@ on:
         default: ""
       image-smoke-script:
         description: Optional script in the repo, run as `<script> <image@digest>` after the build
+        type: string
+        default: ""
+      min-node-version:
+        description: Fail when `node -v` in the image is older than this (e.g. v24.22.1, Node2Shell). Empty = no check
         type: string
         default: ""
       trivy-ignore-unfixed:
@@ -256,6 +264,12 @@ jobs:
               echo "No script '$script' in package.json, skipped"
             fi
           done
+      - name: Extra check commands
+        if: inputs.extra-commands != ''
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          EXTRA: ${{ inputs.extra-commands }}
+        run: bash -euo pipefail -c "$EXTRA"
 
   # Runs next to checks; the image only gets its release tags once checks and Trivy pass.
   build:
@@ -411,6 +425,18 @@ jobs:
           set -euo pipefail
           echo "IMAGE=${IMAGE_INPUT:-ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')}" >> "$GITHUB_ENV"
           printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+      - name: Node in the image is new enough
+        if: inputs.min-node-version != ''
+        env:
+          MIN_NODE: ${{ inputs.min-node-version }}
+        run: |
+          set -euo pipefail
+          current="$(docker run --rm --entrypoint node "$IMAGE@$DIGEST" -v)"
+          echo "node $current in $IMAGE@$DIGEST (need >= $MIN_NODE)"
+          if [ "$(printf '%s\n' "$MIN_NODE" "$current" | sort -V | head -1)" != "$MIN_NODE" ]; then
+            echo "::error::Node $current in the image, need >= $MIN_NODE"
+            exit 1
+          fi
       - name: Trivy scan of the image (HIGH/CRITICAL blocks)
         env:
           TRIVY_VERSION: 0.76.1
@@ -418,6 +444,7 @@ jobs:
           TRIVY_USERNAME: ${{ github.actor }}
           TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
           IGNORE_UNFIXED: ${{ inputs.trivy-ignore-unfixed }}
+          PLATFORMS: ${{ inputs.platforms }}
         run: |
           set -euo pipefail
           args=(--quiet --severity "HIGH,CRITICAL" --exit-code 1)
@@ -426,7 +453,12 @@ jobs:
           cd "$RUNNER_TEMP"
           curl -fsSL --retry 3 -o trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
           echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum -c - && tar -xzf trivy.tgz trivy
-          ./trivy image "${args[@]}" "$IMAGE@$DIGEST"
+          # Every platform of a multi-arch image: an arm64 layer can carry other packages than amd64.
+          for platform in ${PLATFORMS//,/ }; do
+            echo "::group::Trivy $platform"
+            ./trivy image "${args[@]}" --platform "$platform" "$IMAGE@$DIGEST"
+            echo "::endgroup::"
+          done
       - name: Promote to the version tag and the channel
         run: |
           set -euo pipefail
