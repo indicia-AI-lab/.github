@@ -39,6 +39,10 @@ on:
         description: package.json scripts to run in this order; missing scripts are skipped
         type: string
         default: lint typecheck test
+      extra-commands:
+        description: Extra shell commands after the scripts, in working-directory (e.g. `npm run test:map -- sample.xml`)
+        type: string
+        default: ""
       db-image:
         description: >-
           Optional Postgres service image (pin it by digest). Tests get DATABASE_URL=postgresql://postgres:postgres@localhost:5432/test.
@@ -154,3 +158,9 @@ jobs:
               echo "No script '$script' in package.json, skipped"
             fi
           done
+      - name: Extra check commands
+        if: inputs.extra-commands != ''
+        working-directory: ${{ inputs.working-directory }}
+        env:
+          EXTRA: ${{ inputs.extra-commands }}
+        run: bash -euo pipefail -c "$EXTRA"
