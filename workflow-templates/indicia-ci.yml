@@ -19,9 +19,10 @@ jobs:
   ci:
     permissions:
       contents: read
-    uses: indicia-AI-lab/.github/.github/workflows/ci-node.yml@282f03b5ab6bba23077669885bb88dab534dcc89 # v1.1.1
+    uses: indicia-AI-lab/.github/.github/workflows/ci-node.yml@e61b78b271447b665922a565deb7286021aebf19 # v1.2.0
     # with:
     #   node-version: "24.22.1"        # or keep the default node-version-file: .node-version
     #   package-manager: pnpm          # npm (default), pnpm, bun
     #   scripts: lint typecheck test   # package.json scripts that exist are run in this order
     #   db-image: postgres:18.6-alpine@sha256:...   # Postgres service, DATABASE_URL is set
+    #   extra-commands: npm run test:map -- sample.xml
