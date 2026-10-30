@@ -6,6 +6,9 @@ name: nuclei
 #     uses: <org>/.github/.github/workflows/nuclei.yml@<sha>
 #     with:
 #       url: https://app.example.indicia-ai.com
+# Profile `smoke` (default, ~30 s): HTTP templates tagged exposure, misconfig, takeover, unauth,
+# disclosure or token at the chosen severities, 100 req/s. Profile `full`: every template, 20 req/s
+# (6+ min); the nightly kennisbank sweep covers the full set on the known endpoints.
 on:
   workflow_call:
     inputs:
@@ -18,6 +21,11 @@ on:
         required: false
         type: string
         default: high,critical
+      profile:
+        description: "smoke (post-deploy subset, fast) or full (every template)"
+        required: false
+        type: string
+        default: smoke
 
 permissions: {}
 
@@ -27,11 +35,12 @@ env:
   # Templates are pinned too: with -disable-update-check nuclei never downloads them itself.
   TEMPLATES_VERSION: 10.5.1
   TEMPLATES_SHA256: 30fe1cfaced4635f886e4a2673641bba86998dceec28e468274524e789aa56eb
+  SMOKE_TAGS: exposure,misconfig,takeover,unauth,disclosure,token
 
 jobs:
   nuclei:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: ${{ inputs.profile == 'full' && 20 || 5 }}
     permissions:
       contents: read
     steps:
@@ -49,8 +58,15 @@ jobs:
         env:
           TARGET: ${{ inputs.url }}
           SEVERITY: ${{ inputs.severity }}
+          PROFILE: ${{ inputs.profile }}
         run: |
-          "$RUNNER_TEMP/nuclei" -u "$TARGET" -t "$RUNNER_TEMP/nuclei-templates" -severity "$SEVERITY" -rate-limit 20 -silent -disable-update-check -no-interactsh -jsonl -o "$RUNNER_TEMP/nuclei.jsonl"
+          set -euo pipefail
+          case "$PROFILE" in
+            smoke) args=(-pt http -tags "$SMOKE_TAGS" -rate-limit 100 -concurrency 50) ;;
+            full) args=(-rate-limit 20) ;;
+            *) echo "::error::Unknown profile '$PROFILE' (smoke or full)"; exit 1 ;;
+          esac
+          "$RUNNER_TEMP/nuclei" -u "$TARGET" -t "$RUNNER_TEMP/nuclei-templates" -severity "$SEVERITY" "${args[@]}" -silent -disable-update-check -no-interactsh -jsonl -o "$RUNNER_TEMP/nuclei.jsonl"
           if [ -s "$RUNNER_TEMP/nuclei.jsonl" ]; then
             jq -r '"\(.info.severity) \(.["template-id"]) \(.["matched-at"])"' "$RUNNER_TEMP/nuclei.jsonl"
             echo "::error::nuclei found ${SEVERITY} issues on ${TARGET}"
