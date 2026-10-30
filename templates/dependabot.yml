@@ -11,11 +11,14 @@ updates:
     groups:
       production: { dependency-type: production, update-types: [minor, patch] }
       development: { dependency-type: development, update-types: [minor, patch] }
+  # Also bumps the reusable workflows from indicia-AI-lab/.github (ci-node.yml, release-dokploy.yml, nuclei.yml):
+  # SHA + "# vX.Y.Z" comment. Our own refs skip the cooldown and come as one separate PR.
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: weekly, day: monday }
-    cooldown: { default-days: 7 }
+    cooldown: { default-days: 7, exclude: ["indicia-AI-lab/.github*"] }
     groups:
+      indicia-workflows: { patterns: ["indicia-AI-lab/.github*"] }
       actions: { patterns: ["*"] }
   - package-ecosystem: docker
     directories: ["/", "/**"]
