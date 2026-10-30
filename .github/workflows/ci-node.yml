@@ -106,6 +106,9 @@ jobs:
         ports: ["5432:5432"]
         options: >-
           --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      # One fixed pnpm store, so setup-node caches the directory pnpm actually uses (also with working-directory).
+      npm_config_store_dir: /home/runner/.pnpm-store
     steps:
       - name: Database image pinned by digest, URL-safe credentials
         if: inputs.db-image != ''
