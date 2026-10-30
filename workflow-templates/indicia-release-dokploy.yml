@@ -29,7 +29,7 @@ jobs:
       contents: read
       actions: read
       packages: write
-    uses: indicia-AI-lab/.github/.github/workflows/release-dokploy.yml@282f03b5ab6bba23077669885bb88dab534dcc89 # v1.1.1
+    uses: indicia-AI-lab/.github/.github/workflows/release-dokploy.yml@e61b78b271447b665922a565deb7286021aebf19 # v1.2.0
     # Environment secrets (DOKPLOY_WEBHOOK_URL[S]) reach the reusable deploy job only via inherit;
     # the reusable workflow is our own, pinned by SHA.
     # nosemgrep: yaml.github-actions.security.secrets-inherit.secrets-inherit -- environment secrets, own pinned workflow
@@ -39,3 +39,4 @@ jobs:
     #   checks: false               # no package.json (static site)
     #   context: .                  # dockerfile, target, platforms (linux/amd64), build-args
     #   image-smoke-script: .github/scripts/image-smoke.sh
+    #   min-node-version: v24.22.1  # node -v in the image (Node2Shell floor)
