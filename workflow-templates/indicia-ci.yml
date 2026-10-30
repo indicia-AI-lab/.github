@@ -1,8 +1,8 @@
 name: CI
 
-# Indicia standard: lint, typecheck and tests on every pull request and on main.
+# Indicia standard: the checks live in indicia-AI-lab/.github (ci-node.yml). Change them there and bump the ref
+# (Dependabot github-actions does that). Repo-specific: node version, package manager, scripts, db-image.
 # The org also runs the required `security` workflow on every pull request; you do not need to add it here.
-# Node comes from .node-version (put e.g. 24.22.1 in it); npm by default, see the comments for pnpm and bun.
 on:
   pull_request:
   push:
@@ -16,24 +16,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  checks:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  ci:
     permissions:
       contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version-file: .node-version
-          # npm cache: fine here, this workflow publishes nothing. Never in release or deploy workflows
-          # (cache poisoning). pnpm: run `corepack enable` before this step and use `cache: pnpm`.
-          cache: npm
-      # pnpm: pnpm install --frozen-lockfile; bun: use oven-sh/setup-bun pinned by SHA.
-      - run: npm ci --no-audit --no-fund
-      - run: npm audit --audit-level=high --omit=dev
-      - run: npm run lint --if-present
-      - run: npm run typecheck --if-present
-      - run: npm test --if-present
+    uses: indicia-AI-lab/.github/.github/workflows/ci-node.yml@c3b49a10a656b6cbd8fcc5872e7a4ffc1dced727 # v1.1.0
+    # with:
+    #   node-version: "24.22.1"        # or keep the default node-version-file: .node-version
+    #   package-manager: pnpm          # npm (default), pnpm, bun
+    #   scripts: lint typecheck test   # package.json scripts that exist are run in this order
+    #   db-image: postgres:18.6-alpine@sha256:...   # Postgres service, DATABASE_URL is set

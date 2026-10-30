@@ -1,23 +1,15 @@
 name: Release
 
-# Indicia standard release: tag -> image on GHCR (amd64, GitHub-hosted) -> Trivy scan of the digest
-# -> promote tags -> Dokploy webhook -> nuclei smoke check of the live URL.
+# Indicia standard release via indicia-AI-lab/.github (release-dokploy.yml). Change it there and bump the ref.
 #   X.Y.Z      -> environment production, tag must be on the default branch, image :X.Y.Z + :latest
 #   X.Y.Z-rc.N -> environment acceptance, any branch, image :X.Y.Z-rc.N + :acc
-# Every build pushes :sha-<commit> first and gets its other tags only after checks and Trivy pass.
-# A prod tag on a commit that an rc run already built (checks, build and Trivy green; that run
-# leaves a `release-image` artifact with the digest) reuses that digest: no checks or rebuild,
-# but a fresh Trivy scan against the current DB. Without such an rc run it builds as an rc does.
+# A prod tag on a commit with a green rc build reuses that image (fresh Trivy scan, no rebuild).
 # Only `release` can create X.Y.Z tags; `developers` and `release` can create -rc tags (org rulesets).
-# No caches anywhere in this workflow: it publishes the production image (cache poisoning).
 # Repo setup:
-#   - environments `acceptance` and `production`, deployment policy "selected branches and tags",
-#     tags only (acceptance: `*-rc*`, production: `[0-9]*`)
-#   - per environment: secret DOKPLOY_WEBHOOK_URL (one app) or DOKPLOY_WEBHOOK_URLS (several apps,
-#     one URL per line, fired in order; any failure fails the job; takes precedence over the singular),
-#     variable LIVE_URL (e.g. https://app.test.indicia-ai.com)
+#   - environments `acceptance` (tags `*-rc*`) and `production` (tags `[0-9]*`)
+#   - per environment: secret DOKPLOY_WEBHOOK_URLS (one URL per line, fired in order) or DOKPLOY_WEBHOOK_URL,
+#     variable LIVE_URL (nuclei smoke check after the deploy)
 #   - Dokploy apps: acc on the test VPS pulling :acc, prod on the prod VPS pulling :latest
-#   - org custom property `deploy_target` (prod-vps, test-vps, mac-mini, none)
 on:
   push:
     tags:
@@ -26,206 +18,24 @@ on:
 
 permissions: {}
 
+# One deploy at a time; never cancel an in-flight deploy.
 concurrency:
   group: release-${{ contains(github.ref_name, '-rc.') && 'acceptance' || 'production' }}
   cancel-in-progress: false
 
 jobs:
-  # Routing, the default-branch guard and the lookup of an rc image for this commit.
-  resolve:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read # compare API for the default-branch guard
-      actions: read # rc runs of this workflow and their artifacts
-    outputs:
-      environment: ${{ contains(github.ref_name, '-rc.') && 'acceptance' || 'production' }}
-      digest: ${{ steps.rc.outputs.digest }}
-    steps:
-      - name: Production tag must be on the default branch
-        if: ${{ !contains(github.ref_name, '-rc.') }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          set -euo pipefail
-          # identical or behind: the tagged commit is an ancestor of (or equal to) the default branch.
-          status="$(gh api "repos/$GITHUB_REPOSITORY/compare/$DEFAULT_BRANCH...$GITHUB_SHA" --jq .status)"
-          case "$status" in
-            identical|behind) echo "$GITHUB_REF_NAME ($GITHUB_SHA) is on $DEFAULT_BRANCH" ;;
-            *) echo "::error::Tag $GITHUB_REF_NAME is not on $DEFAULT_BRANCH ($status)"; exit 1 ;;
-          esac
-      - name: Image an rc run built for this commit
-        id: rc
-        if: ${{ !contains(github.ref_name, '-rc.') }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          WORKFLOW_REF: ${{ github.workflow_ref }}
-        run: |
-          set -euo pipefail
-          # Same commit means the same workflow file, so an rc run of it checked, built and scanned this code.
-          workflow="${WORKFLOW_REF%%@*}"
-          workflow="${workflow##*/}"
-          runs="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?head_sha=$GITHUB_SHA&event=push&per_page=100" \
-            --jq '[.workflow_runs[] | select(.head_branch | test("^[0-9]+\\.[0-9]+\\.[0-9]+-rc\\.[0-9]+$"))] | sort_by(.created_at) | reverse | .[].id')"
-          for run in $runs; do
-            artifact="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts" \
-              --jq '[.artifacts[] | select(.name == "release-image" and (.expired | not))][0].id // empty')"
-            [ -n "$artifact" ] || continue
-            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$artifact/zip" > "$RUNNER_TEMP/release-image.zip"
-            digest="$(unzip -p "$RUNNER_TEMP/release-image.zip" digest)"
-            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-              echo "::error::release-image artifact of run $run holds no valid digest"
-              exit 1
-            fi
-            echo "Reusing the image of rc run $run: $digest"
-            echo "digest=$digest" >> "$GITHUB_OUTPUT"
-            echo "Reused rc image \`$digest\` from run $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          done
-          echo "No rc image for $GITHUB_SHA: checks and a fresh build"
-
-  checks:
-    needs: resolve
-    if: needs.resolve.outputs.digest == ''
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  release:
     permissions:
       contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version-file: .node-version
-          package-manager-cache: false
-      - run: npm ci --no-audit --no-fund
-      - run: npm run typecheck --if-present
-      - run: npm test --if-present
-
-  # Runs next to checks; the image only gets its release tags once checks and Trivy pass.
-  build:
-    needs: resolve
-    if: needs.resolve.outputs.digest == ''
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
+      actions: read
       packages: write
-    outputs:
-      digest: ${{ steps.push.outputs.digest }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: Image name
-        run: echo "IMAGE=ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - id: push
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          platforms: linux/amd64
-          pull: true
-          push: true
-          tags: ${{ env.IMAGE }}:sha-${{ github.sha }}
-
-  # Trivy on the digest (also on a reused rc image: new CVEs since the rc count), then the release tags.
-  image:
-    needs: [resolve, checks, build]
-    if: >-
-      !cancelled() && needs.resolve.result == 'success' &&
-      (needs.resolve.outputs.digest != '' || (needs.checks.result == 'success' && needs.build.result == 'success'))
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      packages: write
-    env:
-      DIGEST: ${{ needs.resolve.outputs.digest || needs.build.outputs.digest }}
-      CHANNEL: ${{ needs.resolve.outputs.environment == 'acceptance' && 'acc' || 'latest' }}
-    steps:
-      - name: Image name and registry login
-        env:
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          ACTOR: ${{ github.actor }}
-        run: |
-          set -euo pipefail
-          echo "IMAGE=ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
-          printf '%s' "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-      - name: Trivy scan of the image
-        env:
-          TRIVY_VERSION: 0.76.1
-          TRIVY_SHA256: c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0
-          TRIVY_USERNAME: ${{ github.actor }}
-          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          cd "$RUNNER_TEMP"
-          curl -fsSL -o trivy.tgz "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
-          echo "${TRIVY_SHA256}  trivy.tgz" | sha256sum -c - && tar -xzf trivy.tgz trivy
-          ./trivy image --quiet --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$IMAGE@$DIGEST"
-      - name: Promote to the version tag and the channel
-        run: |
-          set -euo pipefail
-          docker buildx imagetools create -t "$IMAGE:$GITHUB_REF_NAME" -t "$IMAGE:$CHANNEL" "$IMAGE@$DIGEST"
-          echo "Image \`$IMAGE@$DIGEST\` (revision \`$GITHUB_SHA\`) as :$GITHUB_REF_NAME and :$CHANNEL" >> "$GITHUB_STEP_SUMMARY"
-      # Proof for a later prod tag on this commit: checks, build and Trivy passed for this digest.
-      - name: Record the digest
-        if: needs.resolve.outputs.digest == ''
-        run: printf '%s' "$DIGEST" > "$RUNNER_TEMP/digest"
-      - if: needs.resolve.outputs.digest == ''
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: release-image
-          path: ${{ runner.temp }}/digest
-          retention-days: 90
-          if-no-files-found: error
-
-  deploy:
-    needs: [resolve, image]
-    if: ${{ !cancelled() && needs.image.result == 'success' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions: {}
-    environment: ${{ needs.resolve.outputs.environment }}
-    outputs:
-      live_url: ${{ steps.live.outputs.url }}
-    steps:
-      - name: Dokploy webhook(s)
-        env:
-          WEBHOOKS: ${{ secrets.DOKPLOY_WEBHOOK_URLS }}
-          WEBHOOK: ${{ secrets.DOKPLOY_WEBHOOK_URL }}
-        run: |
-          set -euo pipefail
-          urls="${WEBHOOKS:-$WEBHOOK}"
-          n=0
-          while IFS= read -r url || [ -n "$url" ]; do
-            url="$(printf '%s' "$url" | tr -d '[:space:]')"
-            [ -n "$url" ] || continue
-            n=$((n + 1))
-            echo "Webhook $n"
-            curl -fsS --retry 3 --retry-delay 5 -X POST "$url" -o /dev/null \
-              || { echo "::error::Dokploy webhook $n failed"; exit 1; }
-          done <<< "$urls"
-          [ "$n" -gt 0 ] || { echo "::error::Neither DOKPLOY_WEBHOOK_URLS nor DOKPLOY_WEBHOOK_URL is set in this environment"; exit 1; }
-      # A reusable-workflow job cannot use an environment, so hand the environment's LIVE_URL on.
-      - id: live
-        env:
-          LIVE_URL: ${{ vars.LIVE_URL }}
-        run: echo "url=${LIVE_URL}" >> "$GITHUB_OUTPUT"
-
-  # Verify the deployed revision yourself as well: a green webhook only means Dokploy accepted the request.
-  smoke:
-    needs: deploy
-    if: ${{ !cancelled() && needs.deploy.result == 'success' && needs.deploy.outputs.live_url != '' }}
-    permissions:
-      contents: read
-    uses: indicia-AI-lab/.github/.github/workflows/nuclei.yml@057cf17e9fdeae9b20db7d83ba72aa844051ff51 # v1.0.4
-    with:
-      url: ${{ needs.deploy.outputs.live_url }}
+    uses: indicia-AI-lab/.github/.github/workflows/release-dokploy.yml@c3b49a10a656b6cbd8fcc5872e7a4ffc1dced727 # v1.1.0
+    # Environment secrets (DOKPLOY_WEBHOOK_URL[S]) reach the reusable deploy job only via inherit;
+    # the reusable workflow is our own, pinned by SHA.
+    # nosemgrep: yaml.github-actions.security.secrets-inherit.secrets-inherit -- environment secrets, own pinned workflow
+    secrets: inherit # zizmor: ignore[secrets-inherit]
+    # with:
+    #   node-version: "24.22.1"     # or the default node-version-file: .node-version
+    #   checks: false               # no package.json (static site)
+    #   context: .                  # dockerfile, target, platforms (linux/amd64), build-args
+    #   image-smoke-script: .github/scripts/image-smoke.sh

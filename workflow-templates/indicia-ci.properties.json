@@ -1,1 +1,1 @@
-{"name":"Indicia CI (Node)","description":"Lint, typecheck, test en npm audit op elke PR en op main. Node uit .node-version.","iconName":"octicon check-circle","categories":["JavaScript","TypeScript","Node"]}
+{"name": "Indicia CI (Node)", "description": "Thin caller of ci-node.yml in the .github repo: lint, typecheck en test op elke PR en op main, npm/pnpm/bun-cache.", "iconName": "octicon check-circle", "categories": ["JavaScript", "TypeScript", "Node"]}
