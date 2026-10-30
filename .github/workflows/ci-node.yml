@@ -164,7 +164,13 @@ jobs:
           persist-credentials: false
       - name: Enable pnpm via corepack
         if: inputs.package-manager == 'pnpm'
-        run: corepack enable
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          corepack enable
+          # Make the project's pnpm the global default: setup-node asks `pnpm store path` at the repo root.
+          pm="$(jq -r '.packageManager // empty' package.json)"
+          if [ -n "$pm" ]; then corepack install --global "$pm"; fi
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         if: inputs.package-manager != 'bun'
         with:
