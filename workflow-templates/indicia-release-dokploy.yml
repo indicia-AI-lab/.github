@@ -1,6 +1,6 @@
 name: Release
 
-# Indicia standard release via indicia-AI-lab/.github (release-dokploy.yml). Change it there and bump the ref.
+# Indicia standard release via indicia-AI-lab/.github (release-dokploy.yml) on @main. Change it there; it applies at once.
 #   X.Y.Z      -> environment production, tag must be on the default branch, image :X.Y.Z + :latest
 #   X.Y.Z-rc.N -> environment acceptance, any branch, image :X.Y.Z-rc.N + :acc
 # A prod tag on a commit with a green rc build reuses that image (fresh Trivy scan, no rebuild).
@@ -29,10 +29,10 @@ jobs:
       contents: read
       actions: read
       packages: write
-    uses: indicia-AI-lab/.github/.github/workflows/release-dokploy.yml@6fd64e03b4722f1507afd89018d807dc68b06338 # v1.3.1
+    uses: indicia-AI-lab/.github/.github/workflows/release-dokploy.yml@main # zizmor: ignore[unpinned-uses] own org reusable, main is PR-only with a canary check
     # Environment secrets (DOKPLOY_WEBHOOK_URL[S]) reach the reusable deploy job only via inherit;
-    # the reusable workflow is our own, pinned by SHA.
-    # nosemgrep: yaml.github-actions.security.secrets-inherit.secrets-inherit -- environment secrets, own pinned workflow
+    # the reusable workflow is our own (org .github, main only via PR).
+    # nosemgrep: yaml.github-actions.security.secrets-inherit.secrets-inherit -- environment secrets, own org workflow
     secrets: inherit # zizmor: ignore[secrets-inherit]
     # with:
     #   node-version: "24.22.1"     # or the default node-version-file: .node-version
@@ -40,3 +40,6 @@ jobs:
     #   context: .                  # dockerfile, target, platforms (linux/amd64), build-args
     #   image-smoke-script: .github/scripts/image-smoke.sh
     #   min-node-version: v24.22.1  # node -v in the image (Node2Shell floor)
+    #   db-image: postgres:18.6-alpine@sha256:...   # heavy checks (DB tests, e2e) run here, not on PR
+    #   health-wait: /health        # poll LIVE_URL + path after the deploy, before nuclei
+    #   health-expect: '"status":"ok"'

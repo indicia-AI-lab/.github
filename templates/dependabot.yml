@@ -1,6 +1,8 @@
 # Indicia standard Dependabot config. Copy to .github/dependabot.yml and remove ecosystems the repo does not use.
-# Security updates are on for every repo; this adds grouped weekly version updates with a cooldown,
-# so a freshly published (possibly compromised) release is not proposed on day one.
+# Version updates come once a week, grouped per ecosystem, so CI runs once per group instead of once per bump.
+# Security updates are on for every repo and stay separate and immediate (groups apply to version updates only).
+# The cooldown keeps a freshly published (possibly compromised) release out for 7 days.
+# Our own reusable workflows (<org>/.github) are referenced on @main, so there is nothing to bump for them.
 version: 2
 updates:
   - package-ecosystem: npm
@@ -11,14 +13,12 @@ updates:
     groups:
       production: { dependency-type: production, update-types: [minor, patch] }
       development: { dependency-type: development, update-types: [minor, patch] }
-  # Also bumps the reusable workflows from indicia-AI-lab/.github (ci-node.yml, release-dokploy.yml, nuclei.yml):
-  # SHA + "# vX.Y.Z" comment. Our own refs skip the cooldown and come as one separate PR.
+      major: { update-types: [major] }
   - package-ecosystem: github-actions
     directory: /
     schedule: { interval: weekly, day: monday }
-    cooldown: { default-days: 7, exclude: ["indicia-AI-lab/.github*"] }
+    cooldown: { default-days: 7 }
     groups:
-      indicia-workflows: { patterns: ["indicia-AI-lab/.github*"] }
       actions: { patterns: ["*"] }
   - package-ecosystem: docker
     directories: ["/", "/**"]
@@ -32,3 +32,4 @@ updates:
     cooldown: { default-days: 7 }
     groups:
       python: { patterns: ["*"], update-types: [minor, patch] }
+      python-major: { patterns: ["*"], update-types: [major] }

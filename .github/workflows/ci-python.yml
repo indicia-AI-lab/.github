@@ -2,13 +2,13 @@ name: ci-python
 
 # Reusable CI for Python projects with uv (pyproject.toml + uv.lock).
 # Caller (.github/workflows/ci.yml), with concurrency and permissions set there:
-#   on: { pull_request: {}, push: { branches: [main] } }
+#   on: { pull_request: {}, workflow_dispatch: {} }   # no push to main: the PR run already checked it
 #   permissions: {}
 #   concurrency: { group: ${{ github.workflow }}-${{ github.ref }}, cancel-in-progress: true }
 #   jobs:
 #     ci:
 #       permissions: { contents: read }
-#       uses: <org>/.github/.github/workflows/ci-python.yml@<sha> # vX.Y.Z
+#       uses: <org>/.github/.github/workflows/ci-python.yml@main # zizmor: ignore[unpinned-uses] own org
 #       with: { checks: ruff ruff-format pyright pytest, extra-commands: uv run lint-imports }
 # Commands with arguments go in extra-commands, e.g. `uv run pytest -m "not live"` with checks `ruff`.
 # The uv cache is on: this workflow publishes nothing. release-dokploy.yml with `runtime: python`

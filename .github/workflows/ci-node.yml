@@ -2,13 +2,13 @@ name: ci-node
 
 # Reusable CI for Node projects (family A: Node + Dockerfile + Dokploy, and image-only repos).
 # Caller (.github/workflows/ci.yml), with concurrency and permissions set there:
-#   on: { pull_request: {}, push: { branches: [main] } }
+#   on: { pull_request: {}, workflow_dispatch: {} }   # no push to main: the PR run already checked it
 #   permissions: {}
 #   concurrency: { group: ${{ github.workflow }}-${{ github.ref }}, cancel-in-progress: true }
 #   jobs:
 #     ci:
 #       permissions: { contents: read }
-#       uses: <org>/.github/.github/workflows/ci-node.yml@<sha> # vX.Y.Z
+#       uses: <org>/.github/.github/workflows/ci-node.yml@main # zizmor: ignore[unpinned-uses] own org
 #       with: { node-version: "22.23.4" }
 # Scripts with arguments: put them in extra-commands, e.g. `npm run test:map -- sample.xml`.
 # Repo without a lockfile: `lockfile: package.json` and `install-command: npm install --no-audit --no-fund`.
