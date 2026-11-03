@@ -3,7 +3,7 @@ name: nuclei
 # Reusable post-deploy check of a live URL. Call it from a release workflow after the deploy job:
 #   smoke:
 #     needs: deploy
-#     uses: <org>/.github/.github/workflows/nuclei.yml@<sha>
+#     uses: <org>/.github/.github/workflows/nuclei.yml@main # zizmor: ignore[unpinned-uses] own org
 #     with:
 #       url: https://app.example.indicia-ai.com
 # Profile `smoke` (default, ~30 s): HTTP templates tagged exposure, misconfig, takeover, unauth,

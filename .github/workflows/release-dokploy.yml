@@ -19,9 +19,13 @@ name: release-dokploy
 #   jobs:
 #     release:
 #       permissions: { contents: read, actions: read, packages: write }
-#       uses: <org>/.github/.github/workflows/release-dokploy.yml@<sha> # vX.Y.Z
+#       uses: <org>/.github/.github/workflows/release-dokploy.yml@main # zizmor: ignore[unpinned-uses] own org
 #       secrets: inherit # zizmor: ignore[secrets-inherit] environment secrets reach a reusable workflow only this way
 #       with: { node-version: "22.23.4" }
+# PR CI stays light (ci-node.yml: lint, typecheck, unit tests). Heavy checks (e2e, DB tests, image smoke)
+# belong here, in scripts/extra-commands/db-image of the release caller.
+# Slow-starting app: `health-wait: /health` (+ `health-expect: '"status":"ok"'`) polls LIVE_URL after the
+# webhooks, so nuclei scans the new container instead of the old one or a 502.
 # Python with uv: `with: { runtime: python, python-checks: ruff ruff-format pyright pytest }`; the checks
 # job then runs the steps of ci-python.yml instead of the Node steps. Other check inputs as in ci-node.yml.
 # Repo setup: environments `acceptance` (tags `*-rc*`) and `production` (tags `[0-9]*`), each with
@@ -156,6 +160,22 @@ on:
         description: Let Trivy skip HIGH/CRITICAL findings without a fixed version
         type: boolean
         default: true
+      health-wait:
+        description: >-
+          Path on LIVE_URL to poll after the webhooks until the new release answers (e.g. /health or /api/version).
+          Empty = no wait; nuclei then runs as soon as Dokploy accepted the webhook.
+        type: string
+        default: ""
+      health-expect:
+        description: >-
+          Text the health response body must contain (grep -F). `{version}` is replaced by the tag, so
+          `"version":"{version}"` waits for this release instead of the old container. Empty = any 2xx answer.
+        type: string
+        default: ""
+      health-timeout:
+        description: Seconds to keep polling health-wait before the deploy job fails
+        type: number
+        default: 300
 
 permissions: {}
 
@@ -671,6 +691,33 @@ jobs:
         env:
           LIVE_URL: ${{ vars.LIVE_URL }}
         run: echo "url=${LIVE_URL}" >> "$GITHUB_OUTPUT"
+      - name: Wait until the release answers on health-wait
+        if: inputs.health-wait != ''
+        env:
+          LIVE_URL: ${{ vars.LIVE_URL }}
+          HEALTH_PATH: ${{ inputs.health-wait }}
+          HEALTH_EXPECT: ${{ inputs.health-expect }}
+          HEALTH_TIMEOUT: ${{ inputs.health-timeout }}
+        run: |
+          set -uo pipefail
+          [ -n "$LIVE_URL" ] || { echo "::error::health-wait is set but the environment has no LIVE_URL"; exit 1; }
+          url="${LIVE_URL%/}/${HEALTH_PATH#/}"
+          expect="${HEALTH_EXPECT//\{version\}/$GITHUB_REF_NAME}"
+          deadline=$((SECONDS + HEALTH_TIMEOUT))
+          last=""
+          while [ "$SECONDS" -lt "$deadline" ]; do
+            if body="$(curl -fsS --max-time 10 "$url" 2>&1)"; then
+              if [ -z "$expect" ] || grep -qF -- "$expect" <<< "$body"; then
+                echo "$url answered after ${SECONDS}s"
+                exit 0
+              fi
+            fi
+            last="${body:0:300}"
+            sleep 5
+          done
+          [ -z "$expect" ] || url="$url (expecting: $expect)"
+          echo "::error::$url did not answer within ${HEALTH_TIMEOUT}s. Last answer: $last"
+          exit 1
 
   # A green webhook only means Dokploy accepted the request; nuclei checks the live URL.
   smoke:
@@ -678,6 +725,7 @@ jobs:
     if: ${{ !cancelled() && needs.deploy.result == 'success' && needs.deploy.outputs.live_url != '' }}
     permissions:
       contents: read
-    uses: indicia-AI-lab/.github/.github/workflows/nuclei.yml@057cf17e9fdeae9b20db7d83ba72aa844051ff51 # v1.0.4
+    # Own org, on main like every caller (see README): a change to nuclei.yml applies everywhere at once.
+    uses: indicia-AI-lab/.github/.github/workflows/nuclei.yml@main # zizmor: ignore[unpinned-uses] own org reusable, main is PR-only with a canary check
     with:
       url: ${{ needs.deploy.outputs.live_url }}

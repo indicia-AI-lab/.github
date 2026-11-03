@@ -1,0 +1,10 @@
+{
+  "name": "indicia-canary",
+  "private": true,
+  "description": "Fixture for .github/workflows/canary.yml: exercises ci-node.yml without dependencies.",
+  "scripts": {
+    "lint": "node -e \"console.log('lint ok')\"",
+    "typecheck": "node -e \"console.log('typecheck ok')\"",
+    "test": "node check-db.mjs"
+  }
+}

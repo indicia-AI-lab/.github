@@ -1,12 +1,14 @@
 name: CI
 
-# Indicia standard: the checks live in indicia-AI-lab/.github (ci-node.yml). Change them there and bump the ref
-# (Dependabot github-actions does that). Repo-specific: node version, package manager, scripts, db-image.
+# Indicia standard: the checks live in indicia-AI-lab/.github (ci-node.yml), referenced on @main: a change there
+# applies to every repo at once. Repo-specific: node version, package manager, scripts.
+# PR CI is the fast check only (install with cache, lint, typecheck, unit tests). e2e, DB tests, Docker build,
+# Trivy and image smoke run in the release workflow on rc and X.Y.Z tags.
 # The org also runs the required `security` workflow on every pull request; you do not need to add it here.
+# No push trigger on the default branch: the PR run already checked that code.
 on:
   pull_request:
-  push:
-    branches: [$default-branch]
+  workflow_dispatch:
 
 permissions: {}
 
@@ -19,10 +21,9 @@ jobs:
   ci:
     permissions:
       contents: read
-    uses: indicia-AI-lab/.github/.github/workflows/ci-node.yml@6fd64e03b4722f1507afd89018d807dc68b06338 # v1.3.1
+    uses: indicia-AI-lab/.github/.github/workflows/ci-node.yml@main # zizmor: ignore[unpinned-uses] own org reusable, main is PR-only with a canary check
     # with:
     #   node-version: "24.22.1"        # or keep the default node-version-file: .node-version
     #   package-manager: pnpm          # npm (default), pnpm, bun
     #   scripts: lint typecheck test   # package.json scripts that exist are run in this order
-    #   db-image: postgres:18.6-alpine@sha256:...   # Postgres service, DATABASE_URL is set
     #   extra-commands: npm run test:map -- sample.xml
